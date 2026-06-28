@@ -318,6 +318,7 @@ const AVCodecTag ff_codec_movaudio_tags[] = {
     { AV_CODEC_ID_DTS,             MKTAG('d', 't', 's', 'l') }, /* DTS-HD Lossless formats */
     { AV_CODEC_ID_DTS,             MKTAG('d', 't', 's', 'e') }, /* DTS Express */
     { AV_CODEC_ID_DTS,             MKTAG('D', 'T', 'S', ' ') }, /* non-standard */
+    { AV_CODEC_ID_AV3A,            MKTAG('a', 'v', '3', 'a') }, /* AV3A Audio Vivid */
     { AV_CODEC_ID_EAC3,            MKTAG('e', 'c', '-', '3') }, /* ETSI TS 102 366 Annex F (only valid in ISOBMFF) */
     { AV_CODEC_ID_DVAUDIO,         MKTAG('v', 'd', 'v', 'a') },
     { AV_CODEC_ID_DVAUDIO,         MKTAG('d', 'v', 'c', 'a') },
