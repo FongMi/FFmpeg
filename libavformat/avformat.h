@@ -1271,6 +1271,12 @@ typedef struct AVProgram {
                                          seek function will fail. For some
                                          network protocols (e.g. HLS), this can
                                          change dynamically at runtime. */
+#define AVFMTCTX_LIVE          0x0004 /**< signal that the stream is live. Only
+                                         meaningful when
+                                         AVFMTCTX_LIVE_STATUS_KNOWN is set. */
+#define AVFMTCTX_LIVE_STATUS_KNOWN 0x0008 /**< signal that the demuxer has
+                                               determined whether the stream is
+                                               live. */
 
 typedef struct AVChapter {
     int64_t id;             ///< unique ID to identify the chapter
