@@ -197,30 +197,69 @@ static void get_word(char *buf, int buf_size, const char **pp)
     get_word_until_chars(buf, buf_size, SPACE_CHARS, pp);
 }
 
-/** Parse a string p in the form of Range:npt=xx-xx, and determine the start
- *  and end time.
- *  Used for seeking in the rtp stream.
+static int rtsp_parse_clock_time(const char *value, int64_t *time)
+{
+    size_t length = strlen(value);
+
+    if (length < 16 || value[8] != 'T' || value[length - 1] != 'Z')
+        return AVERROR(EINVAL);
+    return av_parse_time(time, value, 0);
+}
+
+/**
+ * Parse an RTSP NPT or UTC clock range and determine its start and end time.
  */
-static void rtsp_parse_range_npt(const char *p, int64_t *start, int64_t *end)
+static void rtsp_parse_time_range(const char *p, int64_t *start, int64_t *end)
 {
     char buf[256];
+    int64_t range_start, range_end;
 
     p += strspn(p, SPACE_CHARS);
-    if (!av_stristart(p, "npt=", &p))
-        return;
-
     *start = AV_NOPTS_VALUE;
     *end = AV_NOPTS_VALUE;
 
-    get_word_sep(buf, sizeof(buf), "-", &p);
-    if (av_parse_time(start, buf, 1) < 0)
-        return;
-    if (*p == '-') {
+    if (av_stristart(p, "clock=", &p)) {
+        get_word_sep(buf, sizeof(buf), "-" SPACE_CHARS, &p);
+        if (rtsp_parse_clock_time(buf, &range_start) < 0)
+            return;
+        p += strspn(p, SPACE_CHARS);
+        if (*p != '-')
+            return;
         p++;
-        get_word_sep(buf, sizeof(buf), "-", &p);
-        if (av_parse_time(end, buf, 1) < 0)
-            av_log(NULL, AV_LOG_DEBUG, "Failed to parse interval end specification '%s'\n", buf);
+        get_word_sep(buf, sizeof(buf), ";" SPACE_CHARS, &p);
+        if (!buf[0]) {
+            *start = 0;
+            return;
+        }
+        if (rtsp_parse_clock_time(buf, &range_end) < 0 ||
+            range_end <= range_start)
+            return;
+        *start = 0;
+        *end = range_end - range_start;
+        return;
     }
+
+    if (!av_stristart(p, "npt=", &p) && !av_stristart(p, "npt:", &p))
+        return;
+
+    get_word_sep(buf, sizeof(buf), "-" SPACE_CHARS, &p);
+    if (!av_strcasecmp(buf, "now"))
+        range_start = 0;
+    else if (av_parse_time(&range_start, buf, 1) < 0)
+        return;
+    p += strspn(p, SPACE_CHARS);
+    if (*p != '-')
+        return;
+    p++;
+    get_word_sep(buf, sizeof(buf), ";" SPACE_CHARS, &p);
+    if (!buf[0]) {
+        *start = range_start;
+        return;
+    }
+    if (av_parse_time(&range_end, buf, 1) < 0 || range_end < range_start)
+        return;
+    *start = range_start;
+    *end = range_end;
 }
 
 static int get_sockaddr(AVFormatContext *s,
@@ -661,7 +700,7 @@ static void sdp_parse_line(AVFormatContext *s, SDPParseState *s1,
             int64_t start, end;
 
             // this is so that seeking on a streamed file can work.
-            rtsp_parse_range_npt(p, &start, &end);
+            rtsp_parse_time_range(p, &start, &end);
             s->start_time = start;
             /* AV_NOPTS_VALUE means live broadcast (and can't seek) */
             if (end != AV_NOPTS_VALUE)
@@ -790,8 +829,13 @@ int ff_sdp_parse(AVFormatContext *s, const char *content)
         av_freep(&s1->default_exclude_source_addrs[i]);
     av_freep(&s1->default_exclude_source_addrs);
 
-    if (s->duration == AV_NOPTS_VALUE)
+    s->ctx_flags |= AVFMTCTX_LIVE_STATUS_KNOWN;
+    if (s->duration == AV_NOPTS_VALUE) {
+        s->ctx_flags |= AVFMTCTX_LIVE;
         s->ctx_flags |= AVFMTCTX_UNSEEKABLE;
+    } else {
+        s->ctx_flags &= ~(AVFMTCTX_LIVE | AVFMTCTX_UNSEEKABLE);
+    }
 
     return 0;
 }
@@ -1152,7 +1196,7 @@ void ff_rtsp_parse_line(AVFormatContext *s,
     } else if (av_stristart(p, "CSeq:", &p)) {
         reply->seq = strtol(p, NULL, 10);
     } else if (av_stristart(p, "Range:", &p)) {
-        rtsp_parse_range_npt(p, &reply->range_start, &reply->range_end);
+        rtsp_parse_time_range(p, &reply->range_start, &reply->range_end);
     } else if (av_stristart(p, "RealChallenge1:", &p)) {
         p += strspn(p, SPACE_CHARS);
         av_strlcpy(reply->real_challenge, p, sizeof(reply->real_challenge));
