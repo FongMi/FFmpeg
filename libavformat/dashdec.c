@@ -1293,6 +1293,7 @@ static int parse_manifest(AVFormatContext *s, const char *url, AVIOContext *in)
             goto cleanup;
         }
 
+        c->is_live = 0;
         val = xmlGetProp(node, "type");
         if (!val) {
             av_log(s, AV_LOG_ERROR, "Unable to parse '%s' - missing type attrib\n", url);
@@ -1514,6 +1515,19 @@ static void move_segments(struct representation *rep_src, struct representation 
     }
 }
 
+static void update_live_status(AVFormatContext *s)
+{
+    DASHContext *c = s->priv_data;
+
+    s->ctx_flags &= ~(AVFMTCTX_LIVE | AVFMTCTX_UNSEEKABLE);
+    s->ctx_flags |= AVFMTCTX_LIVE_STATUS_KNOWN;
+    if (c->is_live) {
+        s->ctx_flags |= AVFMTCTX_LIVE | AVFMTCTX_UNSEEKABLE;
+        s->duration = AV_NOPTS_VALUE;
+    } else {
+        s->duration = (int64_t)c->media_presentation_duration * AV_TIME_BASE;
+    }
+}
 
 static int refresh_manifest(AVFormatContext *s)
 {
@@ -1527,6 +1541,8 @@ static int refresh_manifest(AVFormatContext *s)
     int n_subtitles = c->n_subtitles;
     struct representation **subtitles = c->subtitles;
     char *base_url = c->base_url;
+    int is_live = c->is_live;
+    uint64_t media_presentation_duration = c->media_presentation_duration;
 
     c->base_url = NULL;
     c->n_videos = 0;
@@ -1543,19 +1559,22 @@ static int refresh_manifest(AVFormatContext *s)
         av_log(c, AV_LOG_ERROR,
                "new manifest has mismatched no. of video representations, %d -> %d\n",
                n_videos, c->n_videos);
-        return AVERROR_INVALIDDATA;
+        ret = AVERROR_INVALIDDATA;
+        goto finish;
     }
     if (c->n_audios != n_audios) {
         av_log(c, AV_LOG_ERROR,
                "new manifest has mismatched no. of audio representations, %d -> %d\n",
                n_audios, c->n_audios);
-        return AVERROR_INVALIDDATA;
+        ret = AVERROR_INVALIDDATA;
+        goto finish;
     }
     if (c->n_subtitles != n_subtitles) {
         av_log(c, AV_LOG_ERROR,
                "new manifest has mismatched no. of subtitles representations, %d -> %d\n",
                n_subtitles, c->n_subtitles);
-        return AVERROR_INVALIDDATA;
+        ret = AVERROR_INVALIDDATA;
+        goto finish;
     }
 
     for (i = 0; i < n_videos; i++) {
@@ -1593,10 +1612,12 @@ static int refresh_manifest(AVFormatContext *s)
 
 finish:
     // restore context
-    if (c->base_url)
+    if (!ret && c->base_url) {
         av_free(base_url);
-    else
+    } else {
+        av_freep(&c->base_url);
         c->base_url  = base_url;
+    }
 
     if (c->subtitles)
         free_subtitle_list(c);
@@ -1611,6 +1632,12 @@ finish:
     c->audios = audios;
     c->n_videos = n_videos;
     c->videos = videos;
+    if (!ret) {
+        update_live_status(s);
+    } else {
+        c->is_live = is_live;
+        c->media_presentation_duration = media_presentation_duration;
+    }
     return ret;
 }
 
@@ -1738,6 +1765,10 @@ static int open_input(DASHContext *c, struct representation *pls, struct fragmen
         av_dict_set_int(&opts, "offset", seg->url_offset, 0);
         av_dict_set_int(&opts, "end_offset", seg->url_offset + seg->size, 0);
     }
+    /* Do not make the persistent options non-seekable: a dynamic manifest
+     * may become static while it is open. */
+    if (c->is_live)
+        av_dict_set(&opts, "seekable", "0", 0);
 
     ff_make_absolute_url(url, c->max_url_size, c->base_url, seg->url);
     av_log(pls->parent, AV_LOG_VERBOSE, "DASH request for url '%s', offset %"PRId64"\n",
@@ -2078,13 +2109,7 @@ static int dash_read_header(AVFormatContext *s)
     if ((ret = parse_manifest(s, s->url, s->pb)) < 0)
         return ret;
 
-    /* If this isn't a live stream, fill the total duration of the
-     * stream. */
-    if (!c->is_live) {
-        s->duration = (int64_t) c->media_presentation_duration * AV_TIME_BASE;
-    } else {
-        av_dict_set(&c->avio_opts, "seekable", "0", 0);
-    }
+    update_live_status(s);
 
     if(c->n_videos)
         c->is_init_section_common_video = is_common_init_section_exist(c->videos, c->n_videos);
@@ -2298,6 +2323,15 @@ static int dash_seek(AVFormatContext *s, struct representation *pls, int64_t see
         pls->cur_seg_offset = 0;
         if (dry_run)
             return 0;
+        /* Components opened while the manifest was dynamic have no seek
+         * callback. Reopen them once the manifest becomes static. */
+        if (!pls->pb.pub.seek) {
+            pls->init_sec_buf_read_offset = 0;
+            ff_format_io_close(pls->parent, &pls->input);
+            ret = reopen_demux_for_component(s, pls);
+            if (ret < 0)
+                return ret;
+        }
         ff_read_frame_flush(pls->ctx);
         return av_seek_frame(pls->ctx, -1, seek_pos_msec * 1000, flags);
     }
