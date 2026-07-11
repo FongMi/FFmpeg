@@ -398,6 +398,23 @@ static struct variant *new_variant(HLSContext *c, struct variant_info *info,
     return var;
 }
 
+static struct playlist *first_usable_primary_playlist(HLSContext *c)
+{
+    for (int i = 0; i < c->n_variants; i++) {
+        struct variant *var = c->variants[i];
+        struct playlist *pls;
+
+        if (!var->n_playlists || !var->playlists[0])
+            continue;
+        pls = var->playlists[0];
+
+        if (!pls->broken && pls->n_segments)
+            return pls;
+    }
+
+    return NULL;
+}
+
 static void handle_variant_args(void *context, const char *key,
                                 int key_len, char **dest, int *dest_len)
 {
@@ -904,6 +921,7 @@ static int probe_image_wrapped_mpegts(AVIOContext *pb, const char *fmt_name)
 static int parse_playlist(HLSContext *c, const char *url,
                           struct playlist *pls, AVIOContext *in)
 {
+    struct playlist *primary;
     int ret = 0, is_segment = 0, is_variant = 0;
     int64_t duration = 0;
     enum KeyType key_type = KEY_NONE;
@@ -1240,16 +1258,13 @@ fail:
     av_free(new_url);
     if (close_in)
         ff_format_io_close(c->ctx, &in);
+    primary = first_usable_primary_playlist(c);
     c->ctx->ctx_flags = c->ctx->ctx_flags & ~(unsigned)AVFMTCTX_UNSEEKABLE;
-    if (!c->n_variants || !c->variants[0]->n_playlists ||
-        !(c->variants[0]->playlists[0]->finished ||
-          c->variants[0]->playlists[0]->type == PLS_TYPE_EVENT))
+    if (!primary || !(primary->finished || primary->type == PLS_TYPE_EVENT))
         c->ctx->ctx_flags |= AVFMTCTX_UNSEEKABLE;
 
-    if (c->n_variants && c->variants[0]->n_playlists &&
-        c->variants[0]->playlists[0]->type == PLS_TYPE_EVENT &&
-        !c->variants[0]->playlists[0]->finished) {
-        struct playlist *p = c->variants[0]->playlists[0];
+    if (primary && primary->type == PLS_TYPE_EVENT && !primary->finished) {
+        struct playlist *p = primary;
         int64_t duration = 0;
         for (int i = 0; i < p->n_segments; i++)
             duration += p->segments[i]->duration;
@@ -2350,6 +2365,7 @@ static int hls_close(AVFormatContext *s)
 static int hls_read_header(AVFormatContext *s)
 {
     HLSContext *c = s->priv_data;
+    struct playlist *primary;
     int ret = 0, i;
     int64_t highest_cur_seq_no = 0;
 
@@ -2409,20 +2425,31 @@ static int hls_read_header(AVFormatContext *s)
     }
 
     for (i = 0; i < c->n_variants; i++) {
-        if (c->variants[i]->playlists[0]->n_segments == 0) {
-            av_log(s, AV_LOG_WARNING, "Empty segment [%s]\n", c->variants[i]->playlists[0]->url);
-            c->variants[i]->playlists[0]->broken = 1;
+        struct playlist *pls = c->variants[i]->playlists[0];
+
+        if (!pls->n_segments) {
+            av_log(s, AV_LOG_WARNING, "Empty segment [%s]\n", pls->url);
+            pls->broken = 1;
         }
     }
 
-    /* Calculate the total duration of the stream if all segments are
-     * available (finished or EVENT playlists). */
-    if (c->variants[0]->playlists[0]->finished ||
-        c->variants[0]->playlists[0]->type == PLS_TYPE_EVENT) {
-        int64_t duration = 0;
-        for (i = 0; i < c->variants[0]->playlists[0]->n_segments; i++)
-            duration += c->variants[0]->playlists[0]->segments[i]->duration;
-        s->duration = duration;
+    primary = first_usable_primary_playlist(c);
+
+    s->ctx_flags &= ~(AVFMTCTX_LIVE | AVFMTCTX_LIVE_STATUS_KNOWN);
+    s->ctx_flags &= ~(unsigned)AVFMTCTX_UNSEEKABLE;
+    if (!primary || !(primary->finished || primary->type == PLS_TYPE_EVENT))
+        s->ctx_flags |= AVFMTCTX_UNSEEKABLE;
+    if (primary) {
+        s->ctx_flags |= AVFMTCTX_LIVE_STATUS_KNOWN;
+        /* Finished and EVENT playlists retain every segment from the start. */
+        if (primary->finished || primary->type == PLS_TYPE_EVENT) {
+            int64_t duration = 0;
+            for (i = 0; i < primary->n_segments; i++)
+                duration += primary->segments[i]->duration;
+            s->duration = duration;
+        }
+        if (!primary->finished)
+            s->ctx_flags |= AVFMTCTX_LIVE;
     }
 
     /* Associate renditions with variants */
