@@ -47,6 +47,7 @@
 #include "url.h"
 
 #include "hls_sample_encryption.h"
+#include "hls_timestamp.h"
 
 #define INITIAL_BUFFER_SIZE 32768
 
@@ -134,6 +135,7 @@ struct playlist {
     int m3u8_hold_counters;
     int64_t cur_seg_offset;
     int64_t last_load_time;
+    int has_discontinuity;
 
     /* Currently active Media Initialization Section */
     struct segment *cur_init_section;
@@ -162,6 +164,9 @@ struct playlist {
     /* Constant offset of this playlist's DTS baseline relative to
      * c->first_timestamp. */
     int64_t ts_offset;
+    FFHLSTimestampState timestamp_state;
+    FFHLSTimestampStreamState *stream_timestamp_states;
+    int n_stream_timestamp_states;
     int64_t seek_timestamp;
     int seek_flags;
     int seek_stream_index; /* into subdemuxer stream array */
@@ -248,6 +253,9 @@ typedef struct HLSContext {
     HLSCryptoContext  crypto_ctx;
 } HLSContext;
 
+static int64_t get_timestamp_baseline(struct playlist *pls, int stream_index);
+static void reset_playlist_timestamps(struct playlist *pls, int64_t segment_start);
+
 static void free_segment_dynarray(struct segment **segments, int n_segments)
 {
     int i;
@@ -291,6 +299,7 @@ static void free_playlist_list(HLSContext *c)
         av_dict_free(&pls->timed_id3_metadata);
         ff_id3v2_free_extra_meta(&pls->id3_deferred_extra);
         av_freep(&pls->init_sec_buf);
+        av_freep(&pls->stream_timestamp_states);
         av_packet_free(&pls->pkt);
         av_freep(&pls->pb.pub.buffer);
         ff_format_io_close(c->ctx, &pls->input);
@@ -354,6 +363,7 @@ static struct playlist *new_playlist(HLSContext *c, const char *url,
     }
     av_strlcpy(pls->url, abs_url, sizeof(pls->url));
     pls->ts_offset = AV_NOPTS_VALUE;
+    ff_hls_timestamp_init(&pls->timestamp_state);
     pls->seek_timestamp = AV_NOPTS_VALUE;
 
     pls->is_id3_timestamped = -1;
@@ -933,6 +943,7 @@ static int parse_playlist(HLSContext *c, const char *url,
     int close_in = 0;
     int64_t seg_offset = 0;
     int64_t seg_size = -1;
+    int discontinuity = 0;
     uint8_t *new_url = NULL;
     struct variant_info variant_info;
     char tmp_str[MAX_URL_SIZE];
@@ -1120,6 +1131,8 @@ static int parse_playlist(HLSContext *c, const char *url,
         } else if (av_strstart(line, "#EXT-X-ENDLIST", &ptr)) {
             if (pls)
                 pls->finished = 1;
+        } else if (!strcmp(line, "#EXT-X-DISCONTINUITY")) {
+            discontinuity = 1;
         } else if (av_strstart(line, "#EXTINF:", &ptr)) {
             double d = atof(ptr) * AV_TIME_BASE;
             if (d < 0 || d > INT64_MAX || isnan(d)) {
@@ -1214,8 +1227,10 @@ static int parse_playlist(HLSContext *c, const char *url,
                 }
                 seg->duration = duration;
                 seg->key_type = key_type;
+                pls->has_discontinuity |= discontinuity;
                 dynarray_add(&pls->segments, &pls->n_segments, seg);
                 is_segment = 0;
+                discontinuity = 0;
 
                 seg->size = seg_size;
                 if (seg_size >= 0) {
@@ -2720,14 +2735,19 @@ static int recheck_discard_flags(AVFormatContext *s, int first)
             continue;
         }
         if (cur_needed && !pls->needed) {
+            int64_t segment_start = AV_NOPTS_VALUE;
+
             pls->needed = 1;
             changed = 1;
             pls->cur_seq_no = select_cur_seq_no(c, pls);
             pls->pb.pub.eof_reached = 0;
             if (c->cur_timestamp != AV_NOPTS_VALUE) {
                 /* catch up */
+                find_timestamp_in_playlist(c, pls, c->cur_timestamp,
+                                           &pls->cur_seq_no, &segment_start);
+                reset_playlist_timestamps(pls, segment_start);
                 pls->seek_timestamp = c->cur_timestamp +
-                    (pls->ts_offset != AV_NOPTS_VALUE ? pls->ts_offset : 0);
+                    get_timestamp_baseline(pls, -1);
                 pls->seek_flags = AVSEEK_FLAG_ANY;
                 pls->seek_stream_index = -1;
             }
@@ -2779,6 +2799,105 @@ static AVRational get_timebase(struct playlist *pls)
         return MPEG_TIME_BASE_Q;
 
     return pls->ctx->streams[pls->pkt->stream_index]->time_base;
+}
+
+static int ensure_timestamp_stream_state(struct playlist *pls, int stream_index)
+{
+    FFHLSTimestampStreamState *states;
+    int old_count;
+
+    if (stream_index < pls->n_stream_timestamp_states)
+        return 0;
+
+    old_count = pls->n_stream_timestamp_states;
+    states = av_realloc_array(pls->stream_timestamp_states,
+                              stream_index + 1, sizeof(*states));
+    if (!states)
+        return AVERROR(ENOMEM);
+
+    pls->stream_timestamp_states = states;
+    pls->n_stream_timestamp_states = stream_index + 1;
+    for (int i = old_count; i < pls->n_stream_timestamp_states; i++)
+        ff_hls_timestamp_stream_init(&states[i]);
+
+    return 0;
+}
+
+static int64_t get_timestamp_baseline(struct playlist *pls, int stream_index)
+{
+    if (stream_index >= 0 && stream_index < pls->n_stream_timestamp_states &&
+        pls->stream_timestamp_states[stream_index].baseline != AV_NOPTS_VALUE)
+        return pls->stream_timestamp_states[stream_index].baseline;
+
+    return pls->ts_offset == AV_NOPTS_VALUE ? 0 : pls->ts_offset;
+}
+
+static void reset_playlist_timestamps(struct playlist *pls, int64_t segment_start)
+{
+    if (!pls->has_discontinuity)
+        return;
+
+    ff_hls_timestamp_reset(&pls->timestamp_state,
+                           pls->stream_timestamp_states,
+                           pls->n_stream_timestamp_states,
+                           segment_start);
+}
+
+static int normalize_playlist_timestamp(HLSContext *c, struct playlist *pls)
+{
+    FFHLSTimestampStreamState *stream_state;
+    AVStream *stream;
+    AVRational time_base;
+    int64_t duration;
+    int64_t dts;
+    int64_t discontinuity_threshold;
+    int64_t mapped_dts;
+    int64_t packet_offset;
+    int64_t old_offset;
+    int ret;
+
+    if (!pls->has_discontinuity || pls->pkt->dts == AV_NOPTS_VALUE)
+        return 0;
+
+    stream = pls->ctx->streams[pls->pkt->stream_index];
+    if (stream->codecpar->codec_type != AVMEDIA_TYPE_AUDIO &&
+        stream->codecpar->codec_type != AVMEDIA_TYPE_VIDEO)
+        return 0;
+
+    ret = ensure_timestamp_stream_state(pls, pls->pkt->stream_index);
+    if (ret < 0)
+        return ret;
+
+    time_base = get_timebase(pls);
+    dts = av_rescale_q(pls->pkt->dts, time_base, AV_TIME_BASE_Q);
+    duration = av_rescale_q(pls->pkt->duration, time_base, AV_TIME_BASE_Q);
+    stream_state = &pls->stream_timestamp_states[pls->pkt->stream_index];
+    if (stream_state->baseline == AV_NOPTS_VALUE &&
+        c->first_timestamp != AV_NOPTS_VALUE) {
+        if (pls->timestamp_state.segment_start == AV_NOPTS_VALUE)
+            stream_state->baseline = av_sat_sub64(dts, c->first_timestamp);
+        else
+            stream_state->baseline = get_timestamp_baseline(pls, -1);
+    }
+
+    old_offset = pls->timestamp_state.offset;
+    discontinuity_threshold = FFMAX(av_sat_add64(pls->target_duration,
+                                                 pls->target_duration),
+                                    AV_TIME_BASE);
+    mapped_dts = ff_hls_timestamp_map(&pls->timestamp_state, stream_state,
+                                      dts, duration, discontinuity_threshold);
+    if (pls->timestamp_state.offset != old_offset)
+        av_log(pls->parent, AV_LOG_VERBOSE,
+               "HLS timestamp discontinuity in playlist %d: offset %"PRId64" -> %"PRId64"\n",
+               pls->index, old_offset, pls->timestamp_state.offset);
+
+    packet_offset = av_sat_sub64(mapped_dts, dts);
+    pls->pkt->dts = av_rescale_q(mapped_dts, AV_TIME_BASE_Q, time_base);
+    if (pls->pkt->pts != AV_NOPTS_VALUE)
+        pls->pkt->pts = av_sat_add64(pls->pkt->pts,
+            av_rescale_q(packet_offset, AV_TIME_BASE_Q, time_base));
+
+    return 0;
 }
 
 static int compare_ts_with_wrapdetect(int64_t ts_a, struct playlist *pls_a,
@@ -2870,6 +2989,10 @@ static int hls_read_packet(AVFormatContext *s, AVPacket *pkt)
                         }
                         pls->ts_offset = ts - c->first_timestamp;
                     }
+
+                    ret = normalize_playlist_timestamp(c, pls);
+                    if (ret < 0)
+                        return ret;
                 }
 
                 seg = current_segment(pls);
@@ -3062,6 +3185,12 @@ static int hls_read_seek(AVFormatContext *s, int stream_index,
         /* Reset reading */
         struct playlist *pls = c->playlists[i];
         AVIOContext *const pb = &pls->pb.pub;
+        int64_t playlist_segment_start = seg_start_ts;
+
+        if (pls != seek_pls)
+            find_timestamp_in_playlist(c, pls, seek_timestamp,
+                                       &pls->cur_seq_no,
+                                       &playlist_segment_start);
         ff_format_io_close(pls->parent, &pls->input);
         pls->input_read_done = 0;
         pls->input_reuse = 0;
@@ -3084,21 +3213,19 @@ static int hls_read_seek(AVFormatContext *s, int stream_index,
 
         /* Reset the init segment so it's re-fetched and served appropriately */
         pls->cur_init_section = NULL;
+        reset_playlist_timestamps(pls, playlist_segment_start);
 
         /* The discard in hls_read_packet compares this playlist's packet DTS
          * against seek_timestamp, but seek_timestamp is on c->first_timestamp's
          * baseline (whichever stream produced the first packet). Streams can
          * have different DTS baselines, so translate the threshold onto this
          * playlist's own baseline using its captured offset. */
-        if (pls->ts_offset != AV_NOPTS_VALUE)
-            pls->seek_timestamp = seek_timestamp + pls->ts_offset;
-        else
-            pls->seek_timestamp = seek_timestamp;
+        pls->seek_timestamp = seek_timestamp +
+            get_timestamp_baseline(pls,
+                pls == seek_pls ? pls->seek_stream_index : -1);
         pls->seek_flags = flags;
 
         if (pls != seek_pls) {
-            /* set closest segment seq_no for playlists not handled above */
-            find_timestamp_in_playlist(c, pls, seek_timestamp, &pls->cur_seq_no, NULL);
             /* seek the playlist to the given position without taking
              * keyframes into account since this playlist does not have the
              * specified stream where we should look for the keyframes */
