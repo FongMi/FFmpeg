@@ -55,9 +55,13 @@
  *
  */
 
+#define FF_MEDIACODEC_MIME_DOLBY_VISION "video/dolby-vision"
+
 int ff_AMediaCodecProfile_getProfileFromAVCodecContext(AVCodecContext *avctx);
 
-char *ff_AMediaCodecList_getCodecNameByType(const char *mime, int profile, int encoder, void *log_ctx);
+char *ff_AMediaCodecList_getCodecNameByType(const char *mime, int profile,
+                                            int encoder, const char **codec_mime,
+                                            void *log_ctx);
 
 typedef struct FFAMediaFormat FFAMediaFormat;
 struct FFAMediaFormat {
