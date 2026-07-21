@@ -743,7 +743,9 @@ static int mediacodec_dec_flush_codec(AVCodecContext *avctx, MediaCodecDecContex
 static int mediacodec_dec_get_video_codec(AVCodecContext *avctx, MediaCodecDecContext *s,
                                           const char *mime, FFAMediaFormat *format)
 {
-    int profile;
+    int32_t profile;
+    int32_t format_profile;
+    const char *codec_mime = mime;
 
     enum AVPixelFormat pix_fmt;
     static const enum AVPixelFormat pix_fmts[] = {
@@ -773,14 +775,18 @@ static int mediacodec_dec_get_video_codec(AVCodecContext *avctx, MediaCodecDecCo
     }
 
     profile = ff_AMediaCodecProfile_getProfileFromAVCodecContext(avctx);
+    if (ff_AMediaFormat_getInt32(format, "profile", &format_profile))
+        profile = format_profile;
     if (profile < 0) {
         av_log(avctx, AV_LOG_WARNING, "Unsupported or unknown profile\n");
     }
 
-    s->codec_name = ff_AMediaCodecList_getCodecNameByType(mime, profile, 0, avctx);
+    s->codec_name = ff_AMediaCodecList_getCodecNameByType(
+        mime, profile, 0, &codec_mime, avctx);
     if (!s->codec_name && (avctx->hwaccel_flags & AV_HWACCEL_FLAG_ALLOW_PROFILE_MISMATCH)) {
         profile = -1;
-        s->codec_name = ff_AMediaCodecList_getCodecNameByType(mime, profile, 0, avctx);
+        s->codec_name = ff_AMediaCodecList_getCodecNameByType(
+            mime, profile, 0, &codec_mime, avctx);
     }
     if (!s->codec_name) {
         av_log(avctx, AV_LOG_INFO, "Failed to getCodecNameByType(%s, %d)\n", mime, profile);
@@ -804,9 +810,12 @@ static int mediacodec_dec_get_video_codec(AVCodecContext *avctx, MediaCodecDecCo
         }
     }
     if (!s->codec) {
-        av_log(avctx, AV_LOG_ERROR, "Failed to create media decoder for type %s and name %s\n", mime, s->codec_name);
+        av_log(avctx, AV_LOG_ERROR, "Failed to create media decoder for type %s and name %s\n",
+               codec_mime, s->codec_name);
         return AVERROR_EXTERNAL;
     }
+
+    ff_AMediaFormat_setString(format, "mime", codec_mime);
 
     return 0;
 }
