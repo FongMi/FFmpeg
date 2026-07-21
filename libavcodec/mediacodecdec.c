@@ -27,6 +27,7 @@
 
 #include "libavutil/avassert.h"
 #include "libavutil/common.h"
+#include "libavutil/dovi_meta.h"
 #include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "libavutil/intreadwrite.h"
@@ -59,6 +60,7 @@ typedef struct MediaCodecH264DecContext {
     int use_ndk_codec;
     // Ref. MediaFormat KEY_OPERATING_RATE
     int operating_rate;
+    int dovi_sink_support;
 } MediaCodecH264DecContext;
 
 static av_cold int mediacodec_decode_close(AVCodecContext *avctx)
@@ -305,24 +307,64 @@ static int common_set_extradata(AVCodecContext *avctx, FFAMediaFormat *format)
 }
 #endif
 
-static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
+static const AVDOVIDecoderConfigurationRecord *
+mediacodec_get_dovi_config(AVCodecContext *avctx)
 {
-    int ret;
-    int sdk_int;
+    const AVPacketSideData *sd =
+        ff_get_coded_side_data(avctx, AV_PKT_DATA_DOVI_CONF);
 
-    const char *codec_mime = NULL;
+    if (!sd || sd->size < sizeof(AVDOVIDecoderConfigurationRecord))
+        return NULL;
 
+    return (const AVDOVIDecoderConfigurationRecord *)sd->data;
+}
+
+static int mediacodec_dovi_has_compatible_base_layer(
+    AVCodecContext *avctx,
+    const AVDOVIDecoderConfigurationRecord *dovi)
+{
+    /* Only use explicitly present, independently decodable base layers. */
+    if (!dovi->bl_present_flag)
+        return 0;
+
+    switch (dovi->dv_profile) {
+    case 0:
+        return avctx->codec_id == AV_CODEC_ID_H264;
+    case 2:
+    case 4:
+    case 6:
+    case 7:
+        return avctx->codec_id == AV_CODEC_ID_HEVC;
+    case 8:
+        return avctx->codec_id == AV_CODEC_ID_HEVC &&
+               (dovi->dv_bl_signal_compatibility_id == 1 ||
+                dovi->dv_bl_signal_compatibility_id == 2 ||
+                dovi->dv_bl_signal_compatibility_id == 4);
+    case 9:
+        return avctx->codec_id == AV_CODEC_ID_H264;
+    case 10:
+        return avctx->codec_id == AV_CODEC_ID_AV1 &&
+               (dovi->dv_bl_signal_compatibility_id == 1 ||
+                dovi->dv_bl_signal_compatibility_id == 2 ||
+                dovi->dv_bl_signal_compatibility_id == 4);
+    default:
+        return 0;
+    }
+}
+
+static av_cold int mediacodec_init_decoder(AVCodecContext *avctx,
+                                           MediaCodecH264DecContext *s,
+                                           const AVDOVIDecoderConfigurationRecord *dovi)
+{
     FFAMediaFormat *format = NULL;
-    MediaCodecH264DecContext *s = avctx->priv_data;
-
-    if (s->use_ndk_codec < 0)
-        s->use_ndk_codec = !av_jni_get_java_vm(avctx);
+    const char *codec_mime = NULL;
+    int format_profile = -1;
+    int ret;
 
     format = ff_AMediaFormat_new(s->use_ndk_codec);
     if (!format) {
         av_log(avctx, AV_LOG_ERROR, "Failed to create media format\n");
-        ret = AVERROR_EXTERNAL;
-        goto done;
+        return AVERROR_EXTERNAL;
     }
 
     switch (avctx->codec_id) {
@@ -364,7 +406,7 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
 #endif
 #if CONFIG_MPEG4_MEDIACODEC_DECODER
     case AV_CODEC_ID_MPEG4:
-        codec_mime = "video/mp4v-es",
+        codec_mime = "video/mp4v-es";
 
         ret = common_set_extradata(avctx, format);
         if (ret < 0)
@@ -429,7 +471,22 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
         av_assert0(0);
     }
 
+    if (dovi && dovi->dv_profile <= 10) {
+        codec_mime = FF_MEDIACODEC_MIME_DOLBY_VISION;
+        format_profile = 1 << dovi->dv_profile;
+        av_log(avctx, AV_LOG_INFO,
+               "Dolby Vision profile %u detected, requesting a "
+               "Dolby Vision MediaCodec decoder\n",
+               dovi->dv_profile);
+    } else if (dovi) {
+        av_log(avctx, AV_LOG_WARNING,
+               "Unsupported Dolby Vision profile %u, using the base-layer decoder\n",
+               dovi->dv_profile);
+    }
+
     ff_AMediaFormat_setString(format, "mime", codec_mime);
+    if (format_profile >= 0)
+        ff_AMediaFormat_setInt32(format, "profile", format_profile);
 
     if (avctx->codec_type == AVMEDIA_TYPE_VIDEO) {
         ff_AMediaFormat_setInt32(format, "width", avctx->width);
@@ -456,6 +513,48 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
         goto done;
     }
 
+done:
+    ff_AMediaFormat_delete(format);
+    return ret;
+}
+
+static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
+{
+    const AVDOVIDecoderConfigurationRecord *dovi;
+    const AVDOVIDecoderConfigurationRecord *decoder_dovi;
+    MediaCodecH264DecContext *s = avctx->priv_data;
+    int sdk_int;
+    int ret;
+
+    if (s->use_ndk_codec < 0)
+        s->use_ndk_codec = !av_jni_get_java_vm(avctx);
+
+    dovi = avctx->codec_type == AVMEDIA_TYPE_VIDEO
+           ? mediacodec_get_dovi_config(avctx)
+           : NULL;
+    decoder_dovi = dovi;
+    /* Native Dolby Vision is safe only when the caller has positively
+     * identified a compatible output sink. An unspecified sink must not send
+     * profile 5, which has no compatible base layer, to a regular surface. */
+    if (dovi && s->dovi_sink_support != 1) {
+        if (!mediacodec_dovi_has_compatible_base_layer(avctx, dovi)) {
+            av_log(avctx, AV_LOG_WARNING,
+                   "Native Dolby Vision output is unavailable and profile %u "
+                   "has no compatible base layer; refusing MediaCodec\n",
+                   dovi->dv_profile);
+            return AVERROR(ENOSYS);
+        }
+        av_log(avctx, AV_LOG_INFO,
+               "Native Dolby Vision output is unavailable, using the "
+               "base-layer decoder for profile %u\n",
+               dovi->dv_profile);
+        decoder_dovi = NULL;
+    }
+
+    ret = mediacodec_init_decoder(avctx, s, decoder_dovi);
+    if (ret < 0)
+        goto fail;
+
     av_log(avctx, AV_LOG_INFO,
            "MediaCodec started successfully: codec = %s, ret = %d\n",
            s->ctx->codec_name, ret);
@@ -474,15 +573,10 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
         s->amlogic_mpeg2_api23_workaround = 1;
     }
 
-done:
-    if (format) {
-        ff_AMediaFormat_delete(format);
-    }
+    return ret;
 
-    if (ret < 0) {
-        mediacodec_decode_close(avctx);
-    }
-
+fail:
+    mediacodec_decode_close(avctx);
     return ret;
 }
 
@@ -600,6 +694,9 @@ static const AVOption ff_mediacodec_vdec_options[] = {
                    OFFSET(use_ndk_codec), AV_OPT_TYPE_BOOL, {.i64 = -1}, -1, 1, VD },
     { "operating_rate", "The desired operating rate that the codec will need to operate at, zero for unspecified",
             OFFSET(operating_rate), AV_OPT_TYPE_INT, {.i64 = 0}, 0, INT_MAX, VD },
+    { "dovi_sink_support", "Whether the output sink positively supports native Dolby Vision "
+                           "(-1 unspecified, 0 no, 1 yes); only 1 enables native output",
+            OFFSET(dovi_sink_support), AV_OPT_TYPE_BOOL, {.i64 = -1}, -1, 1, VD },
     { NULL }
 };
 
