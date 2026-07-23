@@ -35,8 +35,9 @@
  *
  * Differences from the NDK API:
  *
- * Buffers returned by ff_AMediaFormat_toString and ff_AMediaFormat_getString
- * are newly allocated buffer and must be freed by the user after use.
+ * Buffers returned by ff_AMediaFormat_toString, ff_AMediaFormat_getBuffer and
+ * ff_AMediaFormat_getString are newly allocated and must be freed by the user
+ * after use.
  *
  * The MediaCrypto API is not implemented.
  *
@@ -221,6 +222,7 @@ struct FFAMediaCodec {
 
     ssize_t (*dequeueOutputBuffer)(FFAMediaCodec* codec, FFAMediaCodecBufferInfo *info, int64_t timeoutUs);
     FFAMediaFormat* (*getOutputFormat)(FFAMediaCodec* codec);
+    FFAMediaFormat* (*getBufferFormat)(FFAMediaCodec* codec, size_t idx);
 
     int (*releaseOutputBuffer)(FFAMediaCodec* codec, size_t idx, int render);
     int (*releaseOutputBufferAtTime)(FFAMediaCodec *codec, size_t idx, int64_t timestampNs);
@@ -232,6 +234,7 @@ struct FFAMediaCodec {
     int (*getBufferFlagCodecConfig)(FFAMediaCodec *codec);
     int (*getBufferFlagEndOfStream)(FFAMediaCodec *codec);
     int (*getBufferFlagKeyFrame)(FFAMediaCodec *codec);
+    int (*getBufferFlagPartialFrame)(FFAMediaCodec *codec);
 
     int (*getConfigureFlagEncode)(FFAMediaCodec *codec);
 
@@ -313,6 +316,11 @@ static inline FFAMediaFormat* ff_AMediaCodec_getOutputFormat(FFAMediaCodec* code
     return codec->getOutputFormat(codec);
 }
 
+static inline FFAMediaFormat* ff_AMediaCodec_getBufferFormat(FFAMediaCodec* codec, size_t idx)
+{
+    return codec->getBufferFormat(codec, idx);
+}
+
 static inline int ff_AMediaCodec_releaseOutputBuffer(FFAMediaCodec* codec, size_t idx, int render)
 {
     return codec->releaseOutputBuffer(codec, idx, render);
@@ -351,6 +359,11 @@ static inline int ff_AMediaCodec_getBufferFlagEndOfStream(FFAMediaCodec *codec)
 static inline int ff_AMediaCodec_getBufferFlagKeyFrame(FFAMediaCodec *codec)
 {
     return codec->getBufferFlagKeyFrame(codec);
+}
+
+static inline int ff_AMediaCodec_getBufferFlagPartialFrame(FFAMediaCodec *codec)
+{
+    return codec->getBufferFlagPartialFrame(codec);
 }
 
 static inline int ff_AMediaCodec_getConfigureFlagEncode(FFAMediaCodec *codec)

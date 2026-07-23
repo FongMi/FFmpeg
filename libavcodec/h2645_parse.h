@@ -97,6 +97,11 @@ enum {
     H2645_FLAG_IS_NALFF =         (1 << 0),
     H2645_FLAG_SMALL_PADDING =    (1 << 1),
     H2645_FLAG_USE_REF =          (1 << 2),
+    /**
+     * For HEVC, extract only parameter sets, SEI and Dolby Vision RPU NAL
+     * units. Other NAL units are skipped without copying their RBSP.
+     */
+    H2645_FLAG_HEVC_METADATA_ONLY = (1 << 3),
 };
 
 /**
