@@ -149,6 +149,7 @@ typedef struct FFAMediaFormatJni {
 
     struct JNIAMediaFormatFields jfields;
     jobject object;
+    bool owns_jfields;
 } FFAMediaFormatJni;
 
 static const FFAMediaFormat media_format_jni;
@@ -164,6 +165,7 @@ struct JNIAMediaCodecFields {
     jfieldID buffer_flag_codec_config_id;
     jfieldID buffer_flag_end_of_stream_id;
     jfieldID buffer_flag_key_frame_id;
+    jfieldID buffer_flag_partial_frame_id;
 
     jfieldID configure_flag_encode_id;
 
@@ -180,6 +182,7 @@ struct JNIAMediaCodecFields {
     jmethodID release_id;
 
     jmethodID get_output_format_id;
+    jmethodID get_buffer_format_id;
 
     jmethodID dequeue_input_buffer_id;
     jmethodID queue_input_buffer_id;
@@ -217,6 +220,7 @@ static const struct FFJniField jni_amediacodec_mapping[] = {
         { "android/media/MediaCodec", "BUFFER_FLAG_CODEC_CONFIG", "I", FF_JNI_STATIC_FIELD, OFFSET(buffer_flag_codec_config_id), 1 },
         { "android/media/MediaCodec", "BUFFER_FLAG_END_OF_STREAM", "I", FF_JNI_STATIC_FIELD, OFFSET(buffer_flag_end_of_stream_id), 1 },
         { "android/media/MediaCodec", "BUFFER_FLAG_KEY_FRAME", "I", FF_JNI_STATIC_FIELD, OFFSET(buffer_flag_key_frame_id), 0 },
+        { "android/media/MediaCodec", "BUFFER_FLAG_PARTIAL_FRAME", "I", FF_JNI_STATIC_FIELD, OFFSET(buffer_flag_partial_frame_id), 0 },
 
         { "android/media/MediaCodec", "CONFIGURE_FLAG_ENCODE", "I", FF_JNI_STATIC_FIELD, OFFSET(configure_flag_encode_id), 1 },
 
@@ -233,6 +237,7 @@ static const struct FFJniField jni_amediacodec_mapping[] = {
         { "android/media/MediaCodec", "release", "()V", FF_JNI_METHOD, OFFSET(release_id), 1 },
 
         { "android/media/MediaCodec", "getOutputFormat", "()Landroid/media/MediaFormat;", FF_JNI_METHOD, OFFSET(get_output_format_id), 1 },
+        { "android/media/MediaCodec", "getOutputFormat", "(I)Landroid/media/MediaFormat;", FF_JNI_METHOD, OFFSET(get_buffer_format_id), 0 },
 
         { "android/media/MediaCodec", "dequeueInputBuffer", "(J)I", FF_JNI_METHOD, OFFSET(dequeue_input_buffer_id), 1 },
         { "android/media/MediaCodec", "queueInputBuffer", "(IIIJI)V", FF_JNI_METHOD, OFFSET(queue_input_buffer_id), 1 },
@@ -270,6 +275,7 @@ typedef struct FFAMediaCodecJni {
     FFAMediaCodec api;
 
     struct JNIAMediaCodecFields jfields;
+    struct JNIAMediaFormatFields mediaformat_jfields;
 
     jobject object;
     jobject buffer_info;
@@ -284,6 +290,7 @@ typedef struct FFAMediaCodecJni {
     int BUFFER_FLAG_CODEC_CONFIG;
     int BUFFER_FLAG_END_OF_STREAM;
     int BUFFER_FLAG_KEY_FRAME;
+    int BUFFER_FLAG_PARTIAL_FRAME;
 
     int CONFIGURE_FLAG_ENCODE;
 
@@ -731,6 +738,7 @@ static FFAMediaFormat *mediaformat_jni_new(void)
     if (ff_jni_init_jfields(env, &format->jfields, jni_amediaformat_mapping, 1, format) < 0) {
         goto fail;
     }
+    format->owns_jfields = true;
 
     object = (*env)->NewObject(env, format->jfields.mediaformat_class, format->jfields.init_id);
     if (!object) {
@@ -753,7 +761,8 @@ fail:
     return (FFAMediaFormat *)format;
 }
 
-static FFAMediaFormat *mediaformat_jni_newFromObject(void *object)
+static FFAMediaFormat *mediaformat_jni_newFromObject(
+    void *object, const struct JNIAMediaFormatFields *jfields)
 {
     JNIEnv *env = NULL;
     FFAMediaFormatJni *format = NULL;
@@ -770,9 +779,7 @@ static FFAMediaFormat *mediaformat_jni_newFromObject(void *object)
         return NULL;
     }
 
-    if (ff_jni_init_jfields(env, &format->jfields, jni_amediaformat_mapping, 1, format) < 0) {
-        goto fail;
-    }
+    format->jfields = *jfields;
 
     format->object = (*env)->NewGlobalRef(env, object);
     if (!format->object) {
@@ -781,8 +788,6 @@ static FFAMediaFormat *mediaformat_jni_newFromObject(void *object)
 
     return (FFAMediaFormat *)format;
 fail:
-    ff_jni_reset_jfields(env, &format->jfields, jni_amediaformat_mapping, 1, format);
-
     av_freep(&format);
 
     return NULL;
@@ -803,7 +808,9 @@ static int mediaformat_jni_delete(FFAMediaFormat* ctx)
     (*env)->DeleteGlobalRef(env, format->object);
     format->object = NULL;
 
-    ff_jni_reset_jfields(env, &format->jfields, jni_amediaformat_mapping, 1, format);
+    if (format->owns_jfields)
+        ff_jni_reset_jfields(env, &format->jfields,
+                             jni_amediaformat_mapping, 1, format);
 
     av_freep(&format);
 
@@ -952,8 +959,12 @@ static int mediaformat_jni_getBuffer(FFAMediaFormat* ctx, const char *name, void
     jstring key = NULL;
     jboolean contains_key;
     jobject result = NULL;
+    void *src;
 
     av_assert0(format != NULL);
+
+    *data = NULL;
+    *size = 0;
 
     JNI_GET_ENV_OR_RETURN(env, format, 0);
 
@@ -964,32 +975,26 @@ static int mediaformat_jni_getBuffer(FFAMediaFormat* ctx, const char *name, void
     }
 
     contains_key = (*env)->CallBooleanMethod(env, format->object, format->jfields.contains_key_id, key);
-    if (!contains_key || (ret = ff_jni_exception_check(env, 1, format)) < 0) {
+    if (!contains_key || ff_jni_exception_check(env, 1, format) < 0) {
         ret = 0;
         goto fail;
     }
 
     result = (*env)->CallObjectMethod(env, format->object, format->jfields.get_bytebuffer_id, key);
-    if ((ret = ff_jni_exception_check(env, 1, format)) < 0) {
+    if (ff_jni_exception_check(env, 1, format) < 0) {
         ret = 0;
         goto fail;
     }
 
-    *data = (*env)->GetDirectBufferAddress(env, result);
+    src = (*env)->GetDirectBufferAddress(env, result);
     *size = (*env)->GetDirectBufferCapacity(env, result);
-
-    if (*data && *size) {
-        void *src = *data;
-        *data = av_malloc(*size);
-        if (!*data) {
-            ret = 0;
-            goto fail;
-        }
-
-        memcpy(*data, src, *size);
+    if (!src || !*size) {
+        ret = 0;
+        goto fail;
     }
 
-    ret = 1;
+    *data = av_memdup(src, *size);
+    ret = *data != NULL;
 fail:
     (*env)->DeleteLocalRef(env, key);
     (*env)->DeleteLocalRef(env, result);
@@ -1217,6 +1222,13 @@ static int codec_init_static_fields(FFAMediaCodecJni *codec)
         }
     }
 
+    if (codec->jfields.buffer_flag_partial_frame_id) {
+        codec->BUFFER_FLAG_PARTIAL_FRAME = (*env)->GetStaticIntField(env, codec->jfields.mediacodec_class, codec->jfields.buffer_flag_partial_frame_id);
+        if ((ret = ff_jni_exception_check(env, 1, codec)) < 0) {
+            goto fail;
+        }
+    }
+
     codec->CONFIGURE_FLAG_ENCODE = (*env)->GetStaticIntField(env, codec->jfields.mediacodec_class, codec->jfields.configure_flag_encode_id);
     if ((ret = ff_jni_exception_check(env, 1, codec)) < 0) {
         goto fail;
@@ -1269,6 +1281,10 @@ static inline FFAMediaCodec *codec_create(int method, const char *arg)
     }
 
     if (ff_jni_init_jfields(env, &codec->jfields, jni_amediacodec_mapping, 1, codec) < 0) {
+        goto fail;
+    }
+    if (ff_jni_init_jfields(env, &codec->mediaformat_jfields,
+                            jni_amediaformat_mapping, 1, codec) < 0) {
         goto fail;
     }
 
@@ -1326,6 +1342,8 @@ fail:
         (*env)->DeleteGlobalRef(env, codec->object);
         (*env)->DeleteGlobalRef(env, codec->buffer_info);
 
+        ff_jni_reset_jfields(env, &codec->mediaformat_jfields,
+                             jni_amediaformat_mapping, 1, codec);
         ff_jni_reset_jfields(env, &codec->jfields, jni_amediacodec_mapping, 1, codec);
         av_freep(&codec);
     }
@@ -1372,6 +1390,8 @@ static int mediacodec_jni_delete(FFAMediaCodec* ctx)
     (*env)->DeleteGlobalRef(env, codec->buffer_info);
     codec->buffer_info = NULL;
 
+    ff_jni_reset_jfields(env, &codec->mediaformat_jfields,
+                         jni_amediaformat_mapping, 1, codec);
     ff_jni_reset_jfields(env, &codec->jfields, jni_amediacodec_mapping, 1, codec);
 
     av_freep(&codec);
@@ -1709,7 +1729,34 @@ static FFAMediaFormat* mediacodec_jni_getOutputFormat(FFAMediaCodec* ctx)
         goto fail;
     }
 
-    ret = mediaformat_jni_newFromObject(mediaformat);
+    ret = mediaformat_jni_newFromObject(mediaformat,
+                                        &codec->mediaformat_jfields);
+fail:
+    (*env)->DeleteLocalRef(env, mediaformat);
+
+    return ret;
+}
+
+static FFAMediaFormat* mediacodec_jni_getBufferFormat(FFAMediaCodec* ctx, size_t idx)
+{
+    FFAMediaFormat *ret = NULL;
+    JNIEnv *env = NULL;
+    FFAMediaCodecJni *codec = (FFAMediaCodecJni *)ctx;
+    jobject mediaformat = NULL;
+
+    if (!codec->jfields.get_buffer_format_id)
+        return NULL;
+
+    JNI_GET_ENV_OR_RETURN(env, codec, NULL);
+
+    mediaformat = (*env)->CallObjectMethod(env, codec->object,
+                                           codec->jfields.get_buffer_format_id,
+                                           (jint)idx);
+    if (ff_jni_exception_check(env, 1, codec) < 0)
+        goto fail;
+
+    ret = mediaformat_jni_newFromObject(mediaformat,
+                                        &codec->mediaformat_jfields);
 fail:
     (*env)->DeleteLocalRef(env, mediaformat);
 
@@ -1750,6 +1797,12 @@ static int mediacodec_jni_getBufferFlagKeyFrame(FFAMediaCodec *ctx)
 {
     FFAMediaCodecJni *codec = (FFAMediaCodecJni *)ctx;
     return codec->BUFFER_FLAG_KEY_FRAME;
+}
+
+static int mediacodec_jni_getBufferFlagPartialFrame(FFAMediaCodec *ctx)
+{
+    FFAMediaCodecJni *codec = (FFAMediaCodecJni *)ctx;
+    return codec->BUFFER_FLAG_PARTIAL_FRAME;
 }
 
 static int mediacodec_jni_getConfigureFlagEncode(FFAMediaCodec *ctx)
@@ -1849,6 +1902,7 @@ static const FFAMediaCodec media_codec_jni = {
 
     .dequeueOutputBuffer = mediacodec_jni_dequeueOutputBuffer,
     .getOutputFormat = mediacodec_jni_getOutputFormat,
+    .getBufferFormat = mediacodec_jni_getBufferFormat,
 
     .releaseOutputBuffer = mediacodec_jni_releaseOutputBuffer,
     .releaseOutputBufferAtTime = mediacodec_jni_releaseOutputBufferAtTime,
@@ -1860,6 +1914,7 @@ static const FFAMediaCodec media_codec_jni = {
     .getBufferFlagCodecConfig = mediacodec_jni_getBufferFlagCodecConfig,
     .getBufferFlagEndOfStream = mediacodec_jni_getBufferFlagEndOfStream,
     .getBufferFlagKeyFrame = mediacodec_jni_getBufferFlagKeyFrame,
+    .getBufferFlagPartialFrame = mediacodec_jni_getBufferFlagPartialFrame,
 
     .getConfigureFlagEncode = mediacodec_jni_getConfigureFlagEncode,
     .cleanOutputBuffers = mediacodec_jni_cleanOutputBuffers,
@@ -1872,6 +1927,7 @@ typedef struct FFAMediaFormatNdk {
 
     void *libmedia;
     AMediaFormat *impl;
+    bool owns_libmedia;
 
     bool (*getRect)(AMediaFormat *, const char *name,
                     int32_t *left, int32_t *top, int32_t *right, int32_t *bottom);
@@ -1892,6 +1948,13 @@ typedef struct FFAMediaCodecNdk {
     // Available since API level 28.
     media_status_t (*getName)(AMediaCodec*, char** out_name);
     void (*releaseName)(AMediaCodec*, char* name);
+    AMediaFormat *(*getBufferFormat)(AMediaCodec*, size_t index);
+    bool (*formatGetRect)(AMediaFormat *, const char *name,
+                          int32_t *left, int32_t *top,
+                          int32_t *right, int32_t *bottom);
+    void (*formatSetRect)(AMediaFormat *, const char *name,
+                          int32_t left, int32_t top,
+                          int32_t right, int32_t bottom);
 
     // Available since API level 26.
     media_status_t (*setInputSurface)(AMediaCodec*, ANativeWindow *);
@@ -1948,6 +2011,7 @@ static FFAMediaFormat *mediaformat_ndk_create(AMediaFormat *impl)
         return NULL;
 
     format->api = media_format_ndk;
+    format->owns_libmedia = true;
 
     format->libmedia = dlopen("libmediandk.so", RTLD_NOW);
     if (!format->libmedia)
@@ -1978,6 +2042,26 @@ error:
     return NULL;
 }
 
+static FFAMediaFormat *mediaformat_ndk_wrap(AMediaFormat *impl,
+                                            FFAMediaCodecNdk *codec)
+{
+    FFAMediaFormatNdk *format = av_mallocz(sizeof(*format));
+    if (!format) {
+        AMediaFormat_delete(impl);
+        return NULL;
+    }
+
+    format->api = media_format_ndk;
+    /* Returned formats are shorter-lived than their codec and borrow its
+     * dlopen handle plus optional API symbols. */
+    format->libmedia = codec->libmedia;
+    format->impl = impl;
+    format->getRect = codec->formatGetRect;
+    format->setRect = codec->formatSetRect;
+
+    return (FFAMediaFormat *)format;
+}
+
 static FFAMediaFormat *mediaformat_ndk_new(void)
 {
     return mediaformat_ndk_create(NULL);
@@ -1994,7 +2078,7 @@ static int mediaformat_ndk_delete(FFAMediaFormat* ctx)
 
     if (format->impl && (AMediaFormat_delete(format->impl) != AMEDIA_OK))
             ret = AVERROR_EXTERNAL;
-    if (format->libmedia)
+    if (format->owns_libmedia && format->libmedia)
         dlclose(format->libmedia);
     av_free(format);
 
@@ -2029,7 +2113,15 @@ static int mediaformat_ndk_getFloat(FFAMediaFormat* ctx, const char *name, float
 static int mediaformat_ndk_getBuffer(FFAMediaFormat* ctx, const char *name, void** data, size_t *size)
 {
     FFAMediaFormatNdk *format = (FFAMediaFormatNdk *)ctx;
-    return AMediaFormat_getBuffer(format->impl, name, data, size);
+    void *src = NULL;
+
+    *data = NULL;
+    *size = 0;
+    if (!AMediaFormat_getBuffer(format->impl, name, &src, size) || !src || !*size)
+        return 0;
+
+    *data = av_memdup(src, *size);
+    return *data != NULL;
 }
 
 static int mediaformat_ndk_getString(FFAMediaFormat* ctx, const char *name, const char **out)
@@ -2132,12 +2224,18 @@ static inline FFAMediaCodec *ndk_codec_create(int method, const char *arg) {
 
     GET_SYMBOL(getName)
     GET_SYMBOL(releaseName)
+    GET_SYMBOL(getBufferFormat)
 
     GET_SYMBOL(setInputSurface)
     GET_SYMBOL(signalEndOfInputStream)
     GET_SYMBOL(setAsyncNotifyCallback)
 
 #undef GET_SYMBOL
+
+    codec->formatGetRect =
+        dlsym(codec->libmedia, "AMediaFormat_getRect");
+    codec->formatSetRect =
+        dlsym(codec->libmedia, "AMediaFormat_setRect");
 
     switch (method) {
     case CREATE_CODEC_BY_NAME:
@@ -2320,7 +2418,21 @@ static FFAMediaFormat* mediacodec_ndk_getOutputFormat(FFAMediaCodec* ctx)
 
     if (!format)
         return NULL;
-    return mediaformat_ndk_create(format);
+    return mediaformat_ndk_wrap(format, codec);
+}
+
+static FFAMediaFormat* mediacodec_ndk_getBufferFormat(FFAMediaCodec* ctx, size_t idx)
+{
+    FFAMediaCodecNdk *codec = (FFAMediaCodecNdk *)ctx;
+    AMediaFormat *format;
+
+    if (!codec->getBufferFormat)
+        return NULL;
+
+    format = codec->getBufferFormat(codec->impl, idx);
+    if (!format)
+        return NULL;
+    return mediaformat_ndk_wrap(format, codec);
 }
 
 static int mediacodec_ndk_releaseOutputBuffer(FFAMediaCodec* ctx, size_t idx, int render)
@@ -2379,6 +2491,15 @@ static int mediacodec_ndk_getBufferFlagEndOfStream(FFAMediaCodec *ctx)
 static int mediacodec_ndk_getBufferFlagKeyFrame(FFAMediaCodec *ctx)
 {
     return 1;
+}
+
+static int mediacodec_ndk_getBufferFlagPartialFrame(FFAMediaCodec *ctx)
+{
+#if __ANDROID_API__ >= 24
+    if (android_get_device_api_level() >= 26)
+        return AMEDIACODEC_BUFFER_FLAG_PARTIAL_FRAME;
+#endif
+    return 0;
 }
 
 static int mediacodec_ndk_getConfigureFlagEncode(FFAMediaCodec *ctx)
@@ -2545,6 +2666,7 @@ static const FFAMediaCodec media_codec_ndk = {
 
     .dequeueOutputBuffer = mediacodec_ndk_dequeueOutputBuffer,
     .getOutputFormat = mediacodec_ndk_getOutputFormat,
+    .getBufferFormat = mediacodec_ndk_getBufferFormat,
 
     .releaseOutputBuffer = mediacodec_ndk_releaseOutputBuffer,
     .releaseOutputBufferAtTime = mediacodec_ndk_releaseOutputBufferAtTime,
@@ -2556,6 +2678,7 @@ static const FFAMediaCodec media_codec_ndk = {
     .getBufferFlagCodecConfig = mediacodec_ndk_getBufferFlagCodecConfig,
     .getBufferFlagEndOfStream = mediacodec_ndk_getBufferFlagEndOfStream,
     .getBufferFlagKeyFrame = mediacodec_ndk_getBufferFlagKeyFrame,
+    .getBufferFlagPartialFrame = mediacodec_ndk_getBufferFlagPartialFrame,
 
     .getConfigureFlagEncode = mediacodec_ndk_getConfigureFlagEncode,
     .cleanOutputBuffers = mediacodec_ndk_cleanOutputBuffers,
