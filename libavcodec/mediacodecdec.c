@@ -38,6 +38,7 @@
 #include "avcodec.h"
 #include "codec_internal.h"
 #include "decode.h"
+#include "dovi_rpu.h"
 #include "h264_parse.h"
 #include "h2645_parse.h"
 #include "h264_ps.h"
@@ -69,6 +70,7 @@ typedef struct MediaCodecH264DecContext {
     HEVCParamSets hevc_ps;
     HEVCSEI hevc_sei;
     H2645Packet hevc_metadata_pkt;
+    DOVIContext dovi_ctx;
     AVFrame *buffered_frame_props;
 #endif
 } MediaCodecH264DecContext;
@@ -87,6 +89,7 @@ static av_cold int mediacodec_decode_close(AVCodecContext *avctx)
     ff_h2645_packet_uninit(&s->hevc_metadata_pkt);
     ff_hevc_ps_uninit(&s->hevc_ps);
     ff_hevc_reset_sei(&s->hevc_sei);
+    ff_dovi_ctx_unref(&s->dovi_ctx);
 #endif
 
     return 0;
@@ -320,6 +323,9 @@ static int mediacodec_extract_hevc_metadata(AVCodecContext *avctx,
                                             const AVPacket *pkt,
                                             AVFrame *frame)
 {
+    H2645NAL *rpu_nal = NULL;
+    const uint8_t *side_data;
+    size_t side_data_size;
     int ret;
 
     av_frame_unref(frame);
@@ -330,9 +336,15 @@ static int mediacodec_extract_hevc_metadata(AVCodecContext *avctx,
     if (s->ctx->native_dovi)
         return 0;
 
-    /* Well-described SDR and HLG streams do not carry the PQ metadata
+    side_data = av_packet_get_side_data(pkt, AV_PKT_DATA_DOVI_CONF,
+                                        &side_data_size);
+    if (side_data && side_data_size >= sizeof(s->dovi_ctx.cfg))
+        memcpy(&s->dovi_ctx.cfg, side_data, sizeof(s->dovi_ctx.cfg));
+
+    /* Well-described SDR and HLG streams do not carry the PQ/Dolby metadata
      * exported here. Avoid scanning their compressed access units. */
-    if (avctx->color_trc != AVCOL_TRC_SMPTE2084 &&
+    if (!s->dovi_ctx.cfg.dv_profile &&
+        avctx->color_trc != AVCOL_TRC_SMPTE2084 &&
         avctx->color_trc != AVCOL_TRC_UNSPECIFIED)
         return 0;
 
@@ -368,6 +380,12 @@ static int mediacodec_extract_hevc_metadata(AVCodecContext *avctx,
         case HEVC_NAL_SEI_SUFFIX:
             ret = ff_hevc_decode_nal_sei(&nal->gb, avctx, &s->hevc_sei,
                                          &s->hevc_ps, nal->type);
+            break;
+        case HEVC_NAL_UNSPEC62:
+            ret = 0;
+            if (nal->size > 2 && nal->raw_size > 2 &&
+                !nal->nuh_layer_id && !nal->temporal_id)
+                rpu_nal = nal;
             break;
         default:
             av_assert0(0);
@@ -405,6 +423,36 @@ static int mediacodec_extract_hevc_metadata(AVCodecContext *avctx,
 
         if (trc != AVCOL_TRC_UNSPECIFIED && av_color_transfer_name(trc))
             frame->color_trc = trc;
+    }
+
+    if (rpu_nal) {
+        AVBufferRef *rpu = av_buffer_alloc(rpu_nal->raw_size - 2);
+
+        if (!rpu)
+            return AVERROR(ENOMEM);
+        memcpy(rpu->data, rpu_nal->raw_data + 2, rpu_nal->raw_size - 2);
+
+        ret = ff_dovi_rpu_parse(&s->dovi_ctx,
+                                rpu_nal->data + 2, rpu_nal->size - 2,
+                                avctx->err_recognition);
+        if (ret < 0) {
+            av_buffer_unref(&rpu);
+            if (ret == AVERROR(ENOMEM))
+                return ret;
+            av_log(avctx, AV_LOG_WARNING,
+                   "Ignoring invalid Dolby Vision RPU: %s\n",
+                   av_err2str(ret));
+        } else {
+            if (!av_frame_new_side_data_from_buf(frame,
+                                                 AV_FRAME_DATA_DOVI_RPU_BUFFER,
+                                                 rpu)) {
+                av_buffer_unref(&rpu);
+                return AVERROR(ENOMEM);
+            }
+            ret = ff_dovi_attach_side_data(&s->dovi_ctx, frame);
+            if (ret < 0)
+                return ret;
+        }
     }
 
     mediacodec_reset_unexported_hevc_sei(&s->hevc_sei);
@@ -697,6 +745,9 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
             ret = AVERROR(ENOMEM);
             goto fail;
         }
+        s->dovi_ctx.logctx = avctx;
+        if (dovi)
+            s->dovi_ctx.cfg = *dovi;
     }
 #endif
 
@@ -840,6 +891,7 @@ static void mediacodec_decode_flush(AVCodecContext *avctx)
         if (s->buffered_frame_props)
             av_frame_unref(s->buffered_frame_props);
         ff_hevc_reset_sei(&s->hevc_sei);
+        ff_dovi_ctx_flush(&s->dovi_ctx);
     }
 #endif
 
