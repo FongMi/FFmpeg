@@ -34,9 +34,11 @@
 #include "avcodec.h"
 #include "mediacodec_wrapper.h"
 
+typedef struct MediaCodecPacketProps MediaCodecPacketProps;
+
 typedef struct MediaCodecDecContext {
 
-    AVCodecContext *avctx;
+    const AVClass *avclass;
     atomic_int refcount;
     atomic_int hw_buffer_count;
 
@@ -71,7 +73,16 @@ typedef struct MediaCodecDecContext {
     atomic_int serial;
 
     bool use_ndk_codec;
+    bool native_dovi;
+
+    MediaCodecPacketProps *packet_props_head;
+    MediaCodecPacketProps *packet_props_tail;
+    unsigned packet_props_count;
+    AVBufferRef *hdr10_plus_metadata;
 } MediaCodecDecContext;
+
+void ff_mediacodec_dec_set_input_color(AVCodecContext *avctx,
+                                       FFAMediaFormat *format);
 
 int ff_mediacodec_dec_init(AVCodecContext *avctx,
                            MediaCodecDecContext *s,
@@ -81,6 +92,7 @@ int ff_mediacodec_dec_init(AVCodecContext *avctx,
 int ff_mediacodec_dec_send(AVCodecContext *avctx,
                            MediaCodecDecContext *s,
                            AVPacket *pkt,
+                           const AVFrame *frame_props,
                            bool wait);
 
 int ff_mediacodec_dec_receive(AVCodecContext *avctx,

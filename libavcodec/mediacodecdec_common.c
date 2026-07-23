@@ -25,7 +25,10 @@
 
 #include "libavutil/avassert.h"
 #include "libavutil/common.h"
+#include "libavutil/hdr_dynamic_metadata.h"
 #include "libavutil/hwcontext_mediacodec.h"
+#include "libavutil/intreadwrite.h"
+#include "libavutil/mastering_display_metadata.h"
 #include "libavutil/mem.h"
 #include "libavutil/log.h"
 #include "libavutil/pixfmt.h"
@@ -41,6 +44,21 @@
 #include "mediacodec_sw_buffer.h"
 #include "mediacodec_wrapper.h"
 #include "mediacodecdec_common.h"
+
+struct MediaCodecPacketProps {
+    AVPacket pkt;
+    AVFrameSideData **side_data;
+    int nb_side_data;
+    enum AVColorTransferCharacteristic color_trc;
+    int64_t pts;
+    MediaCodecPacketProps *next;
+};
+
+static const AVClass mediacodec_dec_context_class = {
+    .class_name = "mediacodec decoder",
+    .item_name  = av_default_item_name,
+    .version    = LIBAVUTIL_VERSION_INT,
+};
 
 /**
  * OMX.k3.video.decoder.avc, OMX.NVIDIA.* OMX.SEC.avc.dec and OMX.google
@@ -86,6 +104,141 @@
 #define INPUT_DEQUEUE_TIMEOUT_US 8000
 #define OUTPUT_DEQUEUE_TIMEOUT_US 8000
 #define OUTPUT_DEQUEUE_BLOCK_TIMEOUT_US 1000000
+#define MEDIACODEC_MAX_PACKET_PROPS 256
+
+/* CTA-861.3 HDR Static Metadata Type 1. All 16-bit fields are little-endian. */
+enum {
+    HDR_STATIC_INFO_TYPE_OFFSET            = 0,
+    HDR_STATIC_INFO_PRIMARIES_OFFSET       = 1,
+    HDR_STATIC_INFO_WHITE_POINT_OFFSET     = 13,
+    HDR_STATIC_INFO_MAX_LUMINANCE_OFFSET   = 17,
+    HDR_STATIC_INFO_MIN_LUMINANCE_OFFSET   = 19,
+    HDR_STATIC_INFO_MAX_CLL_OFFSET         = 21,
+    HDR_STATIC_INFO_MAX_FALL_OFFSET        = 23,
+    HDR_STATIC_INFO_TYPE1_SIZE             = 25,
+};
+_Static_assert(HDR_STATIC_INFO_MAX_FALL_OFFSET + 2 == HDR_STATIC_INFO_TYPE1_SIZE,
+               "invalid HDR static metadata layout");
+
+enum {
+    HDR10_PLUS_T35_COUNTRY_CODE        = 0xB5,
+    HDR10_PLUS_T35_PROVIDER_CODE       = 0x003C,
+    HDR10_PLUS_T35_PROVIDER_ORIENTED   = 0x0001,
+    HDR10_PLUS_T35_APPLICATION_ID      = 0x04,
+    HDR10_PLUS_T35_APPLICATION_OFFSET  = 5,
+    HDR10_PLUS_T35_HEADER_SIZE         = 6,
+};
+_Static_assert(HDR10_PLUS_T35_APPLICATION_OFFSET + 1 == HDR10_PLUS_T35_HEADER_SIZE,
+               "invalid HDR10+ T.35 header layout");
+
+static uint16_t hdr_static_u16(AVRational value, int scale)
+{
+    int64_t scaled;
+
+    if (value.num <= 0 || value.den <= 0)
+        return 0;
+    scaled = av_rescale_rnd(value.num, scale, value.den, AV_ROUND_NEAR_INF);
+    return av_clip64(scaled, 0, UINT16_MAX);
+}
+
+void ff_mediacodec_dec_set_input_color(AVCodecContext *avctx,
+                                       FFAMediaFormat *format)
+{
+    const AVPacketSideData *sd;
+    uint8_t hdr_static_info[HDR_STATIC_INFO_TYPE1_SIZE] = { 0 };
+    int value;
+    bool has_hdr_static_info = false;
+
+    value = ff_AMediaFormatColorRange_from_AVColorRange(avctx->color_range);
+    if (value != COLOR_RANGE_UNSPECIFIED)
+        ff_AMediaFormat_setInt32(format, "color-range", value);
+    value = ff_AMediaFormatColorStandard_from_AVColorSpace(avctx->colorspace);
+    if (value != COLOR_STANDARD_UNSPECIFIED)
+        ff_AMediaFormat_setInt32(format, "color-standard", value);
+    value = ff_AMediaFormatColorTransfer_from_AVColorTransfer(avctx->color_trc);
+    if (value != COLOR_TRANSFER_UNSPECIFIED)
+        ff_AMediaFormat_setInt32(format, "color-transfer", value);
+
+    sd = ff_get_coded_side_data(avctx,
+                                AV_PKT_DATA_MASTERING_DISPLAY_METADATA);
+    if (sd && sd->size >= sizeof(AVMasteringDisplayMetadata)) {
+        const AVMasteringDisplayMetadata *mastering = (const void *)sd->data;
+
+        if (mastering->has_primaries) {
+            uint16_t primaries[3][2];
+            uint16_t white_point[2];
+            bool valid = true;
+
+            for (int primary = 0; primary < 3; primary++) {
+                for (int coordinate = 0; coordinate < 2; coordinate++) {
+                    primaries[primary][coordinate] =
+                        hdr_static_u16(
+                            mastering->display_primaries[primary][coordinate],
+                            50000);
+                    valid &= primaries[primary][coordinate] != 0;
+                }
+            }
+            for (int coordinate = 0; coordinate < 2; coordinate++) {
+                white_point[coordinate] =
+                    hdr_static_u16(mastering->white_point[coordinate], 50000);
+                valid &= white_point[coordinate] != 0;
+            }
+
+            if (valid) {
+                for (int primary = 0; primary < 3; primary++) {
+                    AV_WL16(hdr_static_info +
+                            HDR_STATIC_INFO_PRIMARIES_OFFSET + primary * 4,
+                            primaries[primary][0]);
+                    AV_WL16(hdr_static_info +
+                            HDR_STATIC_INFO_PRIMARIES_OFFSET + primary * 4 + 2,
+                            primaries[primary][1]);
+                }
+                AV_WL16(hdr_static_info + HDR_STATIC_INFO_WHITE_POINT_OFFSET,
+                        white_point[0]);
+                AV_WL16(hdr_static_info + HDR_STATIC_INFO_WHITE_POINT_OFFSET + 2,
+                        white_point[1]);
+                has_hdr_static_info = true;
+            }
+        }
+        if (mastering->has_luminance) {
+            uint16_t max_luminance =
+                hdr_static_u16(mastering->max_luminance, 1);
+            uint16_t min_luminance =
+                hdr_static_u16(mastering->min_luminance, 10000);
+
+            if (max_luminance && mastering->min_luminance.num >= 0 &&
+                mastering->min_luminance.den > 0 &&
+                av_cmp_q(mastering->max_luminance,
+                         mastering->min_luminance) > 0) {
+                AV_WL16(hdr_static_info + HDR_STATIC_INFO_MAX_LUMINANCE_OFFSET,
+                        max_luminance);
+                AV_WL16(hdr_static_info + HDR_STATIC_INFO_MIN_LUMINANCE_OFFSET,
+                        min_luminance);
+                has_hdr_static_info = true;
+            }
+        }
+    }
+
+    sd = ff_get_coded_side_data(avctx, AV_PKT_DATA_CONTENT_LIGHT_LEVEL);
+    if (sd && sd->size >= sizeof(AVContentLightMetadata)) {
+        const AVContentLightMetadata *light = (const void *)sd->data;
+
+        if (light->MaxCLL && light->MaxFALL) {
+            AV_WL16(hdr_static_info + HDR_STATIC_INFO_MAX_CLL_OFFSET,
+                    FFMIN(light->MaxCLL, UINT16_MAX));
+            AV_WL16(hdr_static_info + HDR_STATIC_INFO_MAX_FALL_OFFSET,
+                    FFMIN(light->MaxFALL, UINT16_MAX));
+            has_hdr_static_info = true;
+        }
+    }
+
+    if (has_hdr_static_info) {
+        ff_AMediaFormat_setBuffer(format, "hdr-static-info", hdr_static_info,
+                                  sizeof(hdr_static_info));
+        av_log(avctx, AV_LOG_DEBUG,
+               "Passing coded HDR static metadata to MediaCodec\n");
+    }
+}
 
 enum {
     ENCODING_PCM_16BIT        = 0x00000002,
@@ -244,6 +397,112 @@ static enum AVPixelFormat mcdec_map_color_format(AVCodecContext *avctx,
     return ret;
 }
 
+static void mediacodec_packet_props_free(MediaCodecPacketProps **props)
+{
+    MediaCodecPacketProps *entry = *props;
+
+    if (!entry)
+        return;
+
+    av_packet_unref(&entry->pkt);
+    av_frame_side_data_free(&entry->side_data, &entry->nb_side_data);
+    av_freep(props);
+}
+
+static void mediacodec_packet_props_clear(MediaCodecDecContext *s)
+{
+    while (s->packet_props_head) {
+        MediaCodecPacketProps *entry = s->packet_props_head;
+        s->packet_props_head = entry->next;
+        mediacodec_packet_props_free(&entry);
+    }
+    s->packet_props_tail = NULL;
+    s->packet_props_count = 0;
+}
+
+static int mediacodec_packet_props_enqueue(MediaCodecDecContext *s,
+                                           const AVPacket *pkt,
+                                           const AVFrame *frame_props,
+                                           int64_t pts)
+{
+    MediaCodecPacketProps *entry = av_mallocz(sizeof(*entry));
+    int ret;
+
+    if (!entry)
+        return AVERROR(ENOMEM);
+
+    ret = av_packet_copy_props(&entry->pkt, pkt);
+    if (ret < 0) {
+        mediacodec_packet_props_free(&entry);
+        return ret;
+    }
+
+    entry->color_trc = AVCOL_TRC_UNSPECIFIED;
+    if (frame_props) {
+        for (int i = 0; i < frame_props->nb_side_data; i++) {
+            ret = av_frame_side_data_clone(&entry->side_data,
+                                           &entry->nb_side_data,
+                                           frame_props->side_data[i], 0);
+            if (ret < 0) {
+                mediacodec_packet_props_free(&entry);
+                return ret;
+            }
+        }
+        entry->color_trc = frame_props->color_trc;
+    }
+
+    /* Codec-config packets and driver timestamp changes may never produce a
+     * matching output. Bound their retained properties without constraining
+     * the normal MediaCodec reorder window. */
+    if (s->packet_props_count >= MEDIACODEC_MAX_PACKET_PROPS) {
+        MediaCodecPacketProps *stale = s->packet_props_head;
+
+        av_log(s, AV_LOG_WARNING,
+               "Dropping unmatched MediaCodec packet properties at ts=%"PRId64"\n",
+               stale->pts);
+        s->packet_props_head = stale->next;
+        if (s->packet_props_tail == stale)
+            s->packet_props_tail = NULL;
+        s->packet_props_count--;
+        mediacodec_packet_props_free(&stale);
+    }
+
+    entry->pts = pts;
+    if (s->packet_props_tail)
+        s->packet_props_tail->next = entry;
+    else
+        s->packet_props_head = entry;
+    s->packet_props_tail = entry;
+    s->packet_props_count++;
+
+    return 0;
+}
+
+static MediaCodecPacketProps *mediacodec_packet_props_take(MediaCodecDecContext *s,
+                                                           int64_t pts)
+{
+    MediaCodecPacketProps **link = &s->packet_props_head;
+    MediaCodecPacketProps *prev = NULL;
+
+    /* Searching from the head keeps duplicate timestamps in input order. */
+    while (*link) {
+        MediaCodecPacketProps *entry = *link;
+
+        if (entry->pts == pts) {
+            *link = entry->next;
+            if (s->packet_props_tail == entry)
+                s->packet_props_tail = prev;
+            s->packet_props_count--;
+            entry->next = NULL;
+            return entry;
+        }
+        prev = entry;
+        link = &entry->next;
+    }
+
+    return NULL;
+}
+
 static void ff_mediacodec_dec_ref(MediaCodecDecContext *s)
 {
     atomic_fetch_add(&s->refcount, 1);
@@ -255,14 +514,17 @@ static void ff_mediacodec_dec_unref(MediaCodecDecContext *s)
         return;
 
     if (atomic_fetch_sub(&s->refcount, 1) == 1) {
-        if (s->codec) {
-            ff_AMediaCodec_delete(s->codec);
-            s->codec = NULL;
-        }
+        mediacodec_packet_props_clear(s);
+        av_buffer_unref(&s->hdr10_plus_metadata);
 
         if (s->format) {
             ff_AMediaFormat_delete(s->format);
             s->format = NULL;
+        }
+
+        if (s->codec) {
+            ff_AMediaCodec_delete(s->codec);
+            s->codec = NULL;
         }
 
         if (s->surface) {
@@ -283,7 +545,7 @@ static void mediacodec_buffer_release(void *opaque, uint8_t *data)
 
     if (!released && (ctx->delay_flush || buffer->serial == atomic_load(&ctx->serial))) {
         atomic_fetch_sub(&ctx->hw_buffer_count, 1);
-        av_log(ctx->avctx, AV_LOG_DEBUG,
+        av_log(ctx, AV_LOG_DEBUG,
                "Releasing output buffer %zd (%p) ts=%"PRId64" on free() [%d pending]\n",
                buffer->index, buffer, buffer->pts, atomic_load(&ctx->hw_buffer_count));
         ff_AMediaCodec_releaseOutputBuffer(ctx->codec, buffer->index, 0);
@@ -293,10 +555,233 @@ static void mediacodec_buffer_release(void *opaque, uint8_t *data)
     av_freep(&buffer);
 }
 
+static int mediacodec_apply_hdr_static_info(AVCodecContext *avctx,
+                                            FFAMediaFormat *format,
+                                            AVFrame *frame)
+{
+    AVMasteringDisplayMetadata *mastering = NULL;
+    AVContentLightMetadata *light = NULL;
+    uint8_t *data = NULL;
+    size_t size = 0;
+    int ret = 0;
+
+    /* Exact packet/coded metadata is already authoritative. Avoid copying and
+     * parsing the vendor blob when it cannot fill anything on this frame. */
+    if (av_frame_get_side_data(frame, AV_FRAME_DATA_MASTERING_DISPLAY_METADATA) &&
+        av_frame_get_side_data(frame, AV_FRAME_DATA_CONTENT_LIGHT_LEVEL))
+        return 0;
+
+    if (!format || !ff_AMediaFormat_getBuffer(format, "hdr-static-info",
+                                               (void **)&data, &size))
+        return 0;
+
+    if (size < HDR_STATIC_INFO_TYPE1_SIZE ||
+        data[HDR_STATIC_INFO_TYPE_OFFSET] != 0) {
+        av_log(avctx, AV_LOG_WARNING,
+               "Ignoring invalid HDR static info (type=%u size=%zu)\n",
+               size ? data[HDR_STATIC_INFO_TYPE_OFFSET] : 0, size);
+        goto done;
+    }
+
+    /* Packet/coded side data already attached to this exact frame is more
+     * reliable than vendor output defaults. Use MediaFormat only as fallback. */
+    if (!av_frame_get_side_data(frame, AV_FRAME_DATA_MASTERING_DISPLAY_METADATA)) {
+        int has_primaries = 0;
+        const int has_luminance = AV_RL16(data + HDR_STATIC_INFO_MAX_LUMINANCE_OFFSET) != 0;
+
+        for (int offset = HDR_STATIC_INFO_PRIMARIES_OFFSET;
+             offset < HDR_STATIC_INFO_MAX_LUMINANCE_OFFSET; offset += 2)
+            has_primaries |= AV_RL16(data + offset);
+
+        if (has_primaries || has_luminance) {
+            mastering = av_mastering_display_metadata_create_side_data(frame);
+            if (!mastering) {
+                ret = AVERROR(ENOMEM);
+                goto done;
+            }
+        }
+
+        if (has_primaries) {
+            for (int primary = 0; primary < 3; primary++) {
+                mastering->display_primaries[primary][0] = (AVRational) {
+                    AV_RL16(data + HDR_STATIC_INFO_PRIMARIES_OFFSET + primary * 4), 50000 };
+                mastering->display_primaries[primary][1] = (AVRational) {
+                    AV_RL16(data + HDR_STATIC_INFO_PRIMARIES_OFFSET + 2 + primary * 4), 50000 };
+            }
+            mastering->white_point[0] = (AVRational) {
+                AV_RL16(data + HDR_STATIC_INFO_WHITE_POINT_OFFSET), 50000 };
+            mastering->white_point[1] = (AVRational) {
+                AV_RL16(data + HDR_STATIC_INFO_WHITE_POINT_OFFSET + 2), 50000 };
+            mastering->has_primaries = 1;
+        }
+
+        if (has_luminance) {
+            mastering->max_luminance = (AVRational) {
+                AV_RL16(data + HDR_STATIC_INFO_MAX_LUMINANCE_OFFSET), 1 };
+            mastering->min_luminance = (AVRational) {
+                AV_RL16(data + HDR_STATIC_INFO_MIN_LUMINANCE_OFFSET), 10000 };
+            mastering->has_luminance = 1;
+        }
+    }
+
+    if (!av_frame_get_side_data(frame, AV_FRAME_DATA_CONTENT_LIGHT_LEVEL) &&
+        (AV_RL16(data + HDR_STATIC_INFO_MAX_CLL_OFFSET) ||
+         AV_RL16(data + HDR_STATIC_INFO_MAX_FALL_OFFSET))) {
+        light = av_content_light_metadata_create_side_data(frame);
+        if (!light) {
+            ret = AVERROR(ENOMEM);
+            goto done;
+        }
+        light->MaxCLL = AV_RL16(data + HDR_STATIC_INFO_MAX_CLL_OFFSET);
+        light->MaxFALL = AV_RL16(data + HDR_STATIC_INFO_MAX_FALL_OFFSET);
+    }
+
+done:
+    av_freep(&data);
+    return ret;
+}
+
+static int mediacodec_apply_hdr10_plus_info(AVCodecContext *avctx,
+                                            MediaCodecDecContext *s,
+                                            FFAMediaFormat *format,
+                                            AVFrame *frame)
+{
+    AVFrameSideData *side_data =
+        av_frame_get_side_data(frame, AV_FRAME_DATA_DYNAMIC_HDR_PLUS);
+    AVDynamicHDRPlus *hdr_plus;
+    uint8_t *data = NULL;
+    const uint8_t *payload;
+    size_t size = 0;
+    size_t payload_size;
+    int ret;
+
+    if (side_data) {
+        ret = av_buffer_replace(&s->hdr10_plus_metadata, side_data->buf);
+        if (ret < 0)
+            return ret;
+        return 0;
+    }
+
+    if (!format || !ff_AMediaFormat_getBuffer(format, "hdr10-plus-info",
+                                               (void **)&data, &size)) {
+        AVBufferRef *buf;
+
+        if (!s->hdr10_plus_metadata)
+            return 0;
+        buf = av_buffer_ref(s->hdr10_plus_metadata);
+        if (!buf)
+            return AVERROR(ENOMEM);
+        if (!av_frame_new_side_data_from_buf(frame,
+                                             AV_FRAME_DATA_DYNAMIC_HDR_PLUS,
+                                             buf)) {
+            av_buffer_unref(&buf);
+            return AVERROR(ENOMEM);
+        }
+        return 0;
+    }
+
+    payload = data;
+    payload_size = size;
+    /* Android specifies the complete T.35 payload, while some vendor codecs
+     * expose the FFmpeg parser's already-stripped form. Accept both. */
+    if (size >= HDR10_PLUS_T35_HEADER_SIZE &&
+        data[0] == HDR10_PLUS_T35_COUNTRY_CODE &&
+        AV_RB16(data + 1) == HDR10_PLUS_T35_PROVIDER_CODE &&
+        AV_RB16(data + 3) == HDR10_PLUS_T35_PROVIDER_ORIENTED &&
+        data[HDR10_PLUS_T35_APPLICATION_OFFSET] == HDR10_PLUS_T35_APPLICATION_ID) {
+        payload += HDR10_PLUS_T35_HEADER_SIZE;
+        payload_size -= HDR10_PLUS_T35_HEADER_SIZE;
+    }
+
+    hdr_plus = av_dynamic_hdr_plus_create_side_data(frame);
+    if (!hdr_plus) {
+        av_freep(&data);
+        return AVERROR(ENOMEM);
+    }
+
+    ret = av_dynamic_hdr_plus_from_t35(hdr_plus, payload, payload_size);
+    if (ret < 0) {
+        av_log(avctx, AV_LOG_WARNING,
+               "Ignoring invalid HDR10+ output metadata: %s\n",
+               av_err2str(ret));
+        av_frame_remove_side_data(frame, AV_FRAME_DATA_DYNAMIC_HDR_PLUS);
+        ret = 0;
+    } else {
+        side_data = av_frame_get_side_data(frame, AV_FRAME_DATA_DYNAMIC_HDR_PLUS);
+        ret = av_buffer_replace(&s->hdr10_plus_metadata, side_data->buf);
+    }
+
+    av_freep(&data);
+    return ret;
+}
+
+static bool mediacodec_may_use_hdr10_metadata(const AVCodecContext *avctx,
+                                               const MediaCodecDecContext *s)
+{
+    /* The MediaFormat blobs handled here are HDR Static Metadata Type 1 and
+     * HDR10+, both of which accompany PQ video. HLG uses its transfer and
+     * color properties; native Dolby Vision carries its RPU in the coded
+     * stream. Keep probing unspecified non-Dolby streams because some vendors
+     * expose HDR only per buffer. */
+    return !s->native_dovi &&
+           (avctx->color_trc == AVCOL_TRC_SMPTE2084 ||
+            avctx->color_trc == AVCOL_TRC_UNSPECIFIED);
+}
+
+static int mediacodec_apply_frame_props(AVCodecContext *avctx,
+                                        MediaCodecDecContext *s,
+                                        const MediaCodecPacketProps *props,
+                                        FFAMediaFormat *format,
+                                        AVFrame *frame)
+{
+    int ret;
+
+    /* ff_decode_frame_props() has already attached global/coded properties.
+     * Add properties from the exact input packet, then apply metadata parsed
+     * from the coded access unit using the normal decoder-vs-packet preference.
+     * MediaFormat remains a fallback for properties still missing below. */
+    if (props) {
+        ret = ff_decode_frame_props_from_pkt(avctx, frame, &props->pkt);
+        if (ret < 0)
+            return ret;
+    }
+
+    if (avctx->codec_type != AVMEDIA_TYPE_VIDEO)
+        return 0;
+
+    if (props) {
+        for (int i = 0; i < props->nb_side_data; i++) {
+            const AVFrameSideData *src = props->side_data[i];
+            AVBufferRef *buf = av_buffer_ref(src->buf);
+
+            if (!buf)
+                return AVERROR(ENOMEM);
+            ret = ff_frame_new_side_data_from_buf(avctx, frame, src->type,
+                                                  &buf);
+            if (ret < 0)
+                return ret;
+        }
+        if (props->color_trc != AVCOL_TRC_UNSPECIFIED)
+            frame->color_trc = props->color_trc;
+    }
+
+    if (!mediacodec_may_use_hdr10_metadata(avctx, s)) {
+        av_buffer_unref(&s->hdr10_plus_metadata);
+        return 0;
+    }
+
+    ret = mediacodec_apply_hdr_static_info(avctx, format, frame);
+    if (ret < 0)
+        return ret;
+    return mediacodec_apply_hdr10_plus_info(avctx, s, format, frame);
+}
+
 static int mediacodec_wrap_hw_buffer(AVCodecContext *avctx,
                                   MediaCodecDecContext *s,
                                   ssize_t index,
                                   FFAMediaCodecBufferInfo *info,
+                                  const MediaCodecPacketProps *props,
+                                  FFAMediaFormat *format,
                                   AVFrame *frame)
 {
     int ret = 0;
@@ -308,6 +793,18 @@ static int mediacodec_wrap_hw_buffer(AVCodecContext *avctx,
     frame->height = avctx->height;
     frame->format = avctx->pix_fmt;
     frame->sample_aspect_ratio = avctx->sample_aspect_ratio;
+    frame->color_range = avctx->color_range;
+    frame->color_primaries = avctx->color_primaries;
+    frame->color_trc = avctx->color_trc;
+    frame->colorspace = avctx->colorspace;
+
+    ret = ff_decode_frame_props(avctx, frame);
+    if (ret < 0)
+        goto fail;
+
+    ret = mediacodec_apply_frame_props(avctx, s, props, format, frame);
+    if (ret < 0)
+        goto fail;
 
     if (avctx->pkt_timebase.num && avctx->pkt_timebase.den) {
         frame->pts = av_rescale_q(info->presentationTimeUs,
@@ -317,10 +814,6 @@ static int mediacodec_wrap_hw_buffer(AVCodecContext *avctx,
         frame->pts = info->presentationTimeUs;
     }
     frame->pkt_dts = AV_NOPTS_VALUE;
-    frame->color_range = avctx->color_range;
-    frame->color_primaries = avctx->color_primaries;
-    frame->color_trc = avctx->color_trc;
-    frame->colorspace = avctx->colorspace;
 
     buffer = av_mallocz(sizeof(AVMediaCodecBuffer));
     if (!buffer) {
@@ -371,21 +864,36 @@ fail:
 static int mediacodec_wrap_sw_audio_buffer(AVCodecContext *avctx,
                                            MediaCodecDecContext *s,
                                            uint8_t *data,
-                                           size_t size,
                                            ssize_t index,
                                            FFAMediaCodecBufferInfo *info,
+                                           const MediaCodecPacketProps *props,
                                            AVFrame *frame)
 {
     int ret = 0;
     int status = 0;
     const int sample_size = av_get_bytes_per_sample(avctx->sample_fmt);
+    size_t sample_frame_size;
     if (!sample_size) {
         av_log(avctx, AV_LOG_ERROR, "Could not get bytes per sample\n");
         ret = AVERROR(ENOSYS);
         goto done;
     }
 
-    if (info->size % (sample_size * avctx->ch_layout.nb_channels)) {
+    if (avctx->ch_layout.nb_channels <= 0) {
+        av_log(avctx, AV_LOG_ERROR, "Invalid output channel count %d\n",
+               avctx->ch_layout.nb_channels);
+        ret = AVERROR(EINVAL);
+        goto done;
+    }
+
+    if ((size_t)avctx->ch_layout.nb_channels > SIZE_MAX / sample_size) {
+        av_log(avctx, AV_LOG_ERROR, "Output audio sample frame size overflows\n");
+        ret = AVERROR(EINVAL);
+        goto done;
+    }
+    sample_frame_size = sample_size * (size_t)avctx->ch_layout.nb_channels;
+
+    if ((size_t)info->size % sample_frame_size) {
         av_log(avctx, AV_LOG_ERROR, "input is not a multiple of channels * sample_size\n");
         ret = AVERROR(EINVAL);
         goto done;
@@ -393,7 +901,7 @@ static int mediacodec_wrap_sw_audio_buffer(AVCodecContext *avctx,
 
     frame->format = avctx->sample_fmt;
     frame->sample_rate = avctx->sample_rate;
-    frame->nb_samples = info->size / (sample_size * avctx->ch_layout.nb_channels);
+    frame->nb_samples = (size_t)info->size / sample_frame_size;
 
     ret = av_channel_layout_copy(&frame->ch_layout, &avctx->ch_layout);
     if (ret < 0) {
@@ -410,10 +918,12 @@ static int mediacodec_wrap_sw_audio_buffer(AVCodecContext *avctx,
         goto done;
     }
 
-    /* Override frame->pts as ff_get_buffer will override its value based
-     * on the last avpacket received which is not in sync with the frame:
-     *   * N avpackets can be pushed before 1 frame is actually returned
-     *   * 0-sized avpackets are pushed to flush remaining frames at EOS */
+    ret = mediacodec_apply_frame_props(avctx, s, props, NULL, frame);
+    if (ret < 0)
+        goto done;
+
+    /* MediaCodec's output timestamp identifies the decoded output even when
+     * input packets have been queued ahead or output has been reordered. */
     if (avctx->pkt_timebase.num && avctx->pkt_timebase.den) {
         frame->pts = av_rescale_q(info->presentationTimeUs,
                                       AV_TIME_BASE_Q,
@@ -428,7 +938,7 @@ static int mediacodec_wrap_sw_audio_buffer(AVCodecContext *avctx,
            "Frame: format=%d channels=%d sample_rate=%d nb_samples=%d",
            avctx->sample_fmt, avctx->ch_layout.nb_channels, avctx->sample_rate, frame->nb_samples);
 
-    memcpy(frame->data[0], data, info->size);
+    memcpy(frame->data[0], data + info->offset, info->size);
 
     ret = 0;
 done:
@@ -447,6 +957,8 @@ static int mediacodec_wrap_sw_video_buffer(AVCodecContext *avctx,
                                            size_t size,
                                            ssize_t index,
                                            FFAMediaCodecBufferInfo *info,
+                                           const MediaCodecPacketProps *props,
+                                           FFAMediaFormat *format,
                                            AVFrame *frame)
 {
     int ret = 0;
@@ -464,10 +976,12 @@ static int mediacodec_wrap_sw_video_buffer(AVCodecContext *avctx,
         goto done;
     }
 
-    /* Override frame->pkt_pts as ff_get_buffer will override its value based
-     * on the last avpacket received which is not in sync with the frame:
-     *   * N avpackets can be pushed before 1 frame is actually returned
-     *   * 0-sized avpackets are pushed to flush remaining frames at EOS */
+    ret = mediacodec_apply_frame_props(avctx, s, props, format, frame);
+    if (ret < 0)
+        goto done;
+
+    /* MediaCodec's output timestamp identifies the decoded output even when
+     * input packets have been queued ahead or output has been reordered. */
     if (avctx->pkt_timebase.num && avctx->pkt_timebase.den) {
         frame->pts = av_rescale_q(info->presentationTimeUs,
                                       AV_TIME_BASE_Q,
@@ -525,12 +1039,26 @@ static int mediacodec_wrap_sw_buffer(AVCodecContext *avctx,
                                      size_t size,
                                      ssize_t index,
                                      FFAMediaCodecBufferInfo *info,
+                                     const MediaCodecPacketProps *props,
+                                     FFAMediaFormat *format,
                                      AVFrame *frame)
 {
+    if (info->offset < 0 || info->size < 0 ||
+        (size_t)info->offset > size ||
+        (size_t)info->size > size - (size_t)info->offset) {
+        av_log(avctx, AV_LOG_ERROR,
+               "Invalid output buffer range offset=%d size=%d capacity=%zu\n",
+               info->offset, info->size, size);
+        ff_AMediaCodec_releaseOutputBuffer(s->codec, index, 0);
+        return AVERROR_INVALIDDATA;
+    }
+
     if (avctx->codec_type == AVMEDIA_TYPE_AUDIO)
-        return mediacodec_wrap_sw_audio_buffer(avctx, s, data, size, index, info, frame);
+        return mediacodec_wrap_sw_audio_buffer(avctx, s, data, index,
+                                               info, props, frame);
     else if (avctx->codec_type == AVMEDIA_TYPE_VIDEO)
-        return mediacodec_wrap_sw_video_buffer(avctx, s, data, size, index, info, frame);
+        return mediacodec_wrap_sw_video_buffer(avctx, s, data, size, index,
+                                               info, props, format, frame);
     else
         av_assert0(0);
 }
@@ -662,6 +1190,7 @@ fail:
 
 static int mediacodec_dec_parse_audio_format(AVCodecContext *avctx, MediaCodecDecContext *s)
 {
+    AVChannelLayout ch_layout = { 0 };
     int ret = 0;
     int sample_rate = 0;
     int channel_count = 0;
@@ -683,26 +1212,52 @@ static int mediacodec_dec_parse_audio_format(AVCodecContext *avctx, MediaCodecDe
     /* Mandatory fields */
     AMEDIAFORMAT_GET_INT32(channel_count, "channel-count", 1);
     AMEDIAFORMAT_GET_INT32(sample_rate,   "sample-rate",   1);
+    if (channel_count <= 0 || sample_rate <= 0) {
+        av_log(avctx, AV_LOG_ERROR,
+               "Invalid output audio format channel-count=%d sample-rate=%d\n",
+               channel_count, sample_rate);
+        ret = AVERROR(EINVAL);
+        goto fail;
+    }
 
     AMEDIAFORMAT_GET_INT32(pcm_encoding, "pcm-encoding", 0);
     if (pcm_encoding)
         avctx->sample_fmt  = mcdec_map_pcm_format(avctx, s, pcm_encoding);
     else
         avctx->sample_fmt = AV_SAMPLE_FMT_S16;
+    if (avctx->sample_fmt == AV_SAMPLE_FMT_NONE) {
+        ret = AVERROR(ENOSYS);
+        goto fail;
+    }
 
     avctx->sample_rate = sample_rate;
 
     AMEDIAFORMAT_GET_INT32(channel_mask, "channel-mask", 0);
-    if (channel_mask)
-        av_channel_layout_from_mask(&avctx->ch_layout, mcdec_map_channel_mask(avctx, channel_mask));
-    else
-        av_channel_layout_default(&avctx->ch_layout, channel_count);
+    if (channel_mask) {
+        uint64_t mask = mcdec_map_channel_mask(avctx, channel_mask);
+        ret = av_channel_layout_from_mask(&ch_layout, mask);
+        if (ret < 0 || ch_layout.nb_channels != channel_count) {
+            av_log(avctx, AV_LOG_WARNING,
+                   "Ignoring inconsistent output channel mask 0x%x for %d channels\n",
+                   channel_mask, channel_count);
+            av_channel_layout_uninit(&ch_layout);
+            av_channel_layout_default(&ch_layout, channel_count);
+            ret = 0;
+        }
+    } else {
+        av_channel_layout_default(&ch_layout, channel_count);
+    }
+
+    av_channel_layout_uninit(&avctx->ch_layout);
+    avctx->ch_layout = ch_layout;
 
     av_log(avctx, AV_LOG_INFO,
         "Output parameters channel-count=%d channel-layout=%x sample-rate=%d\n",
         channel_count, channel_mask, sample_rate);
 
 fail:
+    if (ret < 0)
+        av_channel_layout_uninit(&ch_layout);
     av_freep(&format);
     return ret;
 }
@@ -730,6 +1285,8 @@ static int mediacodec_dec_flush_codec(AVCodecContext *avctx, MediaCodecDecContex
     atomic_fetch_add(&s->serial, 1);
     atomic_init(&s->hw_buffer_count, 0);
     s->current_input_buffer = -1;
+    mediacodec_packet_props_clear(s);
+    av_buffer_unref(&s->hdr10_plus_metadata);
 
     status = ff_AMediaCodec_flush(codec);
     if (status < 0) {
@@ -845,7 +1402,7 @@ int ff_mediacodec_dec_init(AVCodecContext *avctx, MediaCodecDecContext *s,
     int ret;
     int status;
 
-    s->avctx = avctx;
+    s->avclass = &mediacodec_dec_context_class;
     atomic_init(&s->refcount, 1);
     atomic_init(&s->hw_buffer_count, 0);
     atomic_init(&s->serial, 1);
@@ -905,7 +1462,7 @@ fail:
 }
 
 int ff_mediacodec_dec_send(AVCodecContext *avctx, MediaCodecDecContext *s,
-                           AVPacket *pkt, bool wait)
+                           AVPacket *pkt, const AVFrame *frame_props, bool wait)
 {
     int offset = 0;
     int need_draining = 0;
@@ -930,7 +1487,19 @@ int ff_mediacodec_dec_send(AVCodecContext *avctx, MediaCodecDecContext *s,
         return AVERROR_EOF;
     }
 
+    pts = pkt->pts;
+    if (pts == AV_NOPTS_VALUE) {
+        if (pkt->size)
+            av_log(avctx, AV_LOG_WARNING, "Input packet is missing PTS\n");
+        pts = 0;
+    }
+    if (avctx->pkt_timebase.num && avctx->pkt_timebase.den)
+        pts = av_rescale_q(pts, avctx->pkt_timebase, AV_TIME_BASE_Q);
+
     while (offset < pkt->size || (need_draining && !s->draining)) {
+        uint32_t flags = 0;
+        size_t remaining;
+        size_t chunk_size;
         ssize_t index = s->current_input_buffer;
         if (index < 0) {
             index = ff_AMediaCodec_dequeueInputBuffer(codec, input_dequeue_timeout_us);
@@ -952,15 +1521,6 @@ int ff_mediacodec_dec_send(AVCodecContext *avctx, MediaCodecDecContext *s,
             return AVERROR_EXTERNAL;
         }
 
-        pts = pkt->pts;
-        if (pts == AV_NOPTS_VALUE) {
-            av_log(avctx, AV_LOG_WARNING, "Input packet is missing PTS\n");
-            pts = 0;
-        }
-        if (pts && avctx->pkt_timebase.num && avctx->pkt_timebase.den) {
-            pts = av_rescale_q(pts, avctx->pkt_timebase, AV_TIME_BASE_Q);
-        }
-
         if (need_draining) {
             uint32_t flags = ff_AMediaCodec_getBufferFlagEndOfStream(codec);
 
@@ -979,18 +1539,45 @@ int ff_mediacodec_dec_send(AVCodecContext *avctx, MediaCodecDecContext *s,
             return 0;
         }
 
-        size = FFMIN(pkt->size - offset, size);
-        memcpy(data, pkt->data + offset, size);
-        offset += size;
+        remaining = pkt->size - offset;
+        if (!size) {
+            av_log(avctx, AV_LOG_ERROR, "MediaCodec returned an empty input buffer\n");
+            return AVERROR_EXTERNAL;
+        }
 
-        status = ff_AMediaCodec_queueInputBuffer(codec, index, 0, size, pts, 0);
+        chunk_size = FFMIN(remaining, size);
+        if (chunk_size < remaining) {
+            /* Arbitrary access-unit splits must be marked so MediaCodec keeps
+             * collecting input until the final unmarked buffer arrives. */
+            flags = ff_AMediaCodec_getBufferFlagPartialFrame(codec);
+            if (!flags) {
+                av_log(avctx, AV_LOG_ERROR,
+                       "Input packet size %d exceeds MediaCodec input buffer capacity %zu "
+                       "and partial frames are unsupported\n",
+                       pkt->size, size);
+                return AVERROR(ENOSYS);
+            }
+        }
+
+        memcpy(data, pkt->data + offset, chunk_size);
+        offset += chunk_size;
+
+        status = ff_AMediaCodec_queueInputBuffer(codec, index, 0,
+                                                 chunk_size, pts, flags);
         if (status < 0) {
             av_log(avctx, AV_LOG_ERROR, "Failed to queue input buffer (status = %d)\n", status);
             return AVERROR_EXTERNAL;
         }
 
         av_log(avctx, AV_LOG_TRACE,
-               "Queued input buffer %zd size=%zd ts=%"PRIi64"\n", index, size, pts);
+               "Queued input buffer %zd size=%zu ts=%"PRIi64" flags=%"PRIu32"\n",
+               index, chunk_size, pts, flags);
+    }
+
+    if (pkt->size > 0 && offset == pkt->size) {
+        int ret = mediacodec_packet_props_enqueue(s, pkt, frame_props, pts);
+        if (ret < 0)
+            return ret;
     }
 
     if (offset == 0)
@@ -1011,6 +1598,7 @@ int ff_mediacodec_dec_receive(AVCodecContext *avctx, MediaCodecDecContext *s,
     int64_t output_dequeue_timeout_us = OUTPUT_DEQUEUE_TIMEOUT_US;
 
     if (s->draining && s->eos) {
+        mediacodec_packet_props_clear(s);
         return AVERROR_EOF;
     }
 
@@ -1036,23 +1624,68 @@ int ff_mediacodec_dec_receive(AVCodecContext *avctx, MediaCodecDecContext *s,
             s->eos = 1;
         }
 
-        if (info.size) {
+        if (info.size < 0 || info.offset < 0) {
+            av_log(avctx, AV_LOG_ERROR,
+                   "Invalid output buffer offset=%d size=%d\n",
+                   info.offset, info.size);
+            ff_AMediaCodec_releaseOutputBuffer(codec, index, 0);
+            return AVERROR_INVALIDDATA;
+        }
+
+        if (info.size > 0) {
+            MediaCodecPacketProps *props =
+                mediacodec_packet_props_take(s, info.presentationTimeUs);
+            FFAMediaFormat *buffer_format = NULL;
+            FFAMediaFormat *frame_format = s->format;
+
+            if (avctx->codec_type == AVMEDIA_TYPE_VIDEO &&
+                mediacodec_may_use_hdr10_metadata(avctx, s)) {
+                buffer_format = ff_AMediaCodec_getBufferFormat(codec, index);
+                if (buffer_format)
+                    frame_format = buffer_format;
+            }
+
+            if (!props && s->packet_props_count)
+                av_log(s, AV_LOG_DEBUG,
+                       "No packet properties match output ts=%"PRId64
+                       " (%u queued)\n",
+                       info.presentationTimeUs, s->packet_props_count);
+
             if (s->surface) {
-                if ((ret = mediacodec_wrap_hw_buffer(avctx, s, index, &info, frame)) < 0) {
-                    av_log(avctx, AV_LOG_ERROR, "Failed to wrap MediaCodec buffer\n");
-                    return ret;
-                }
+                ret = mediacodec_wrap_hw_buffer(avctx, s, index, &info,
+                                                props,
+                                                frame_format, frame);
             } else {
                 data = ff_AMediaCodec_getOutputBuffer(codec, index, &size);
                 if (!data) {
                     av_log(avctx, AV_LOG_ERROR, "Failed to get output buffer\n");
-                    return AVERROR_EXTERNAL;
+                    ff_AMediaCodec_releaseOutputBuffer(codec, index, 0);
+                    ret = AVERROR_EXTERNAL;
+                } else {
+                    ret = mediacodec_wrap_sw_buffer(avctx, s, data, size,
+                                                    index, &info,
+                                                    props,
+                                                    frame_format, frame);
                 }
+            }
 
-                if ((ret = mediacodec_wrap_sw_buffer(avctx, s, data, size, index, &info, frame)) < 0) {
-                    av_log(avctx, AV_LOG_ERROR, "Failed to wrap MediaCodec buffer\n");
-                    return ret;
-                }
+            if (buffer_format) {
+                status = ff_AMediaFormat_delete(buffer_format);
+                if (status < 0)
+                    av_log(avctx, AV_LOG_WARNING,
+                           "Failed to delete output buffer MediaFormat\n");
+            }
+            mediacodec_packet_props_free(&props);
+
+            if (ret < 0) {
+                av_log(avctx, AV_LOG_ERROR, "Failed to wrap MediaCodec buffer\n");
+                return ret;
+            }
+
+            if (avctx->codec_type == AVMEDIA_TYPE_VIDEO &&
+                (info.flags & ff_AMediaCodec_getBufferFlagKeyFrame(codec))) {
+                frame->flags |= AV_FRAME_FLAG_KEY;
+                frame->pict_type = AV_PICTURE_TYPE_I;
             }
 
             s->output_buffer_count++;
@@ -1106,8 +1739,10 @@ int ff_mediacodec_dec_receive(AVCodecContext *avctx, MediaCodecDecContext *s,
         return AVERROR_EXTERNAL;
     }
 
-    if (s->draining && s->eos)
+    if (s->draining && s->eos) {
+        mediacodec_packet_props_clear(s);
         return AVERROR_EOF;
+    }
     return AVERROR(EAGAIN);
 }
 
@@ -1145,6 +1780,9 @@ int ff_mediacodec_dec_close(AVCodecContext *avctx, MediaCodecDecContext *s)
 {
     if (!s)
         return 0;
+
+    mediacodec_packet_props_clear(s);
+    av_buffer_unref(&s->hdr10_plus_metadata);
 
     if (s->codec) {
         if (atomic_load(&s->hw_buffer_count) == 0) {
