@@ -36,8 +36,9 @@ static int check_packet(const uint8_t *data, int size, int nal_length_size,
         goto done;
     }
 
-    if (pkt.nb_nals != 1 ||
-        pkt.nals[0].type != HEVC_NAL_SEI_PREFIX) {
+    if (pkt.nb_nals != 2 ||
+        pkt.nals[0].type != HEVC_NAL_SEI_PREFIX ||
+        pkt.nals[1].type != HEVC_NAL_UNSPEC62) {
         fprintf(stderr, "unexpected metadata NAL sequence:");
         for (int i = 0; i < pkt.nb_nals; i++)
             fprintf(stderr, " %d", pkt.nals[i].type);

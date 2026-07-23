@@ -602,7 +602,8 @@ int ff_h2645_packet_split(H2645Packet *pkt, const uint8_t *buf, int length,
                 nal_type != HEVC_NAL_SPS        &&
                 nal_type != HEVC_NAL_PPS        &&
                 nal_type != HEVC_NAL_SEI_PREFIX &&
-                nal_type != HEVC_NAL_SEI_SUFFIX) {
+                nal_type != HEVC_NAL_SEI_SUFFIX &&
+                nal_type != HEVC_NAL_UNSPEC62) {
                 int skip = extract_length;
 
                 if (!(flags & H2645_FLAG_IS_NALFF))
