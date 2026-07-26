@@ -627,6 +627,14 @@ and non-forced subtitles in the same track. Setting this flag to @code{1}
 will only keep the forced subtitles. Default value is @code{0}.
 @end table
 
+@section ttml
+
+The TTML decoder converts text, basic font and color styling, regions, and
+media-time expressions to ASS subtitles. It supports parallel and sequential
+time containers together with clock, offset, frame, and tick time expressions.
+ARIB-TTML resources and features without an ASS text equivalent, including
+embedded images, vertical layout, and ruby layout, are not rendered.
+
 @section libzvbi-teletext
 
 Libzvbi allows libavcodec to decode DVB teletext pages and DVB teletext

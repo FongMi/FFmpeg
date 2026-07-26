@@ -385,6 +385,7 @@ OBJS-$(CONFIG_MLV_DEMUXER)               += mlvdec.o riffdec.o
 OBJS-$(CONFIG_MM_DEMUXER)                += mm.o
 OBJS-$(CONFIG_MMF_DEMUXER)               += mmf.o
 OBJS-$(CONFIG_MMF_MUXER)                 += mmf.o rawenc.o
+OBJS-$(CONFIG_MMTTLV_DEMUXER)            += mmtp.o mmttlv.o
 OBJS-$(CONFIG_MODS_DEMUXER)              += mods.o
 OBJS-$(CONFIG_MOFLEX_DEMUXER)            += moflex.o
 OBJS-$(CONFIG_MOV_DEMUXER)               += mov.o mov_chan.o mov_esds.o \
@@ -793,6 +794,8 @@ TESTPROGS-$(CONFIG_MOV_MUXER)            += movenc
 TESTPROGS-$(CONFIG_NETWORK)              += noproxy
 TESTPROGS-$(CONFIG_SRTP)                 += srtp
 TESTPROGS-$(CONFIG_IMF_DEMUXER)          += imf
+TESTPROGS-$(CONFIG_MMTTLV_DEMUXER)       += mmtp
+TESTPROGS-$(CONFIG_MPEGTS_DEMUXER)       += mpegts
 
 TOOLS     = aviocat                                                     \
             ismindex                                                    \

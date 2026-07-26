@@ -140,6 +140,8 @@ version 8.1:
 - ProRes Vulkan encoder
 - LCEVC parser
 - LCEVC enhancement layer exporting in MPEG-TS
+- MMTP parser, MMT/TLV demuxer, TTML subtitle decoder, and ARIB caption
+  extraction from aribb24.js timed-ID3
 
 
 version 8.0:
