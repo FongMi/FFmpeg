@@ -766,6 +766,7 @@ OBJS-$(CONFIG_TSCC_DECODER)            += tscc.o msrledec.o
 OBJS-$(CONFIG_TSCC2_DECODER)           += tscc2.o
 OBJS-$(CONFIG_TTA_DECODER)             += tta.o ttadata.o ttadsp.o
 OBJS-$(CONFIG_TTA_ENCODER)             += ttaenc.o ttaencdsp.o ttadata.o
+OBJS-$(CONFIG_TTML_DECODER)            += ttmldec.o ass.o
 OBJS-$(CONFIG_TTML_ENCODER)            += ttmlenc.o ass_split.o
 OBJS-$(CONFIG_TWINVQ_DECODER)          += twinvqdec.o twinvq.o
 OBJS-$(CONFIG_TXD_DECODER)             += txd.o
@@ -1386,6 +1387,7 @@ TESTPROGS-$(CONFIG_HEVC_METADATA_BSF)     += h265_levels
 TESTPROGS-$(CONFIG_HEVCPARSE)             += h2645_parse
 TESTPROGS-$(CONFIG_RANGECODER)            += rangecoder
 TESTPROGS-$(CONFIG_SNOW_ENCODER)          += snowenc
+TESTPROGS-$(CONFIG_TTML_DECODER)          += ttml
 
 TESTOBJS = dctref.o
 
