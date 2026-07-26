@@ -445,6 +445,11 @@ static int do_subtitle_out(OutputFile *of, OutputStream *ost, const AVSubtitle *
                 pkt->pts += av_rescale_q(sub->start_display_time, (AVRational){ 1, 1000 }, pkt->time_base);
             else
                 pkt->pts += av_rescale_q(sub->end_display_time, (AVRational){ 1, 1000 }, pkt->time_base);
+        } else {
+            pkt->pts = local_sub.pts;
+            pkt->duration = av_rescale_q(local_sub.end_display_time,
+                                         (AVRational){ 1, 1000 },
+                                         pkt->time_base);
         }
         pkt->dts = pkt->pts;
 

@@ -289,6 +289,7 @@ typedef struct PESContext {
     AVBufferRef *buffer;
     SLConfigDescr sl;
     int merged_st;
+    int id3_arib;
 } PESContext;
 
 EXTERN const FFInputFormat ff_mpegts_demuxer;
@@ -1068,6 +1069,111 @@ end:
     return ret;
 }
 
+static int read_id3v2_syncsafe_size(const uint8_t *data, uint32_t *size)
+{
+    if ((data[0] | data[1] | data[2] | data[3]) & 0x80)
+        return 0;
+
+    *size = (uint32_t)data[0] << 21 |
+            (uint32_t)data[1] << 14 |
+            (uint32_t)data[2] << 7  |
+            data[3];
+    return 1;
+}
+
+static int unwrap_aribb24_id3(AVPacket *pkt)
+{
+    static const uint8_t owner[] = "aribb24.js";
+    const uint8_t *data = pkt->data;
+    const uint8_t *end;
+    uint32_t tag_size;
+    int version;
+
+    if (pkt->size < 10 || memcmp(data, "ID3", 3))
+        return 0;
+
+    version = data[3];
+    if ((version != 3 && version != 4) || data[4] || data[5] ||
+        !read_id3v2_syncsafe_size(data + 6, &tag_size) ||
+        tag_size > (unsigned int)(pkt->size - 10))
+        return 0;
+
+    data += 10;
+    end = data + tag_size;
+    while (end - data >= 10 && data[0]) {
+        const uint8_t *payload = data + 10;
+        uint32_t frame_size;
+
+        if (version == 4) {
+            if (!read_id3v2_syncsafe_size(data + 4, &frame_size))
+                return 0;
+        } else {
+            frame_size = AV_RB32(data + 4);
+        }
+        if (frame_size > (size_t)(end - payload))
+            return 0;
+
+        if (!memcmp(data, "PRIV", 4) && !AV_RB16(data + 8) &&
+            frame_size > sizeof(owner) &&
+            !memcmp(payload, owner, sizeof(owner))) {
+            payload += sizeof(owner);
+            frame_size -= sizeof(owner);
+            if (frame_size < 3 ||
+                (payload[0] != 0x80 && payload[0] != 0x81) ||
+                payload[1] != 0xFF)
+                return 0;
+
+            pkt->data = (uint8_t *)payload;
+            pkt->size = frame_size;
+            return 1;
+        }
+        data = payload + frame_size;
+    }
+
+    return 0;
+}
+
+static void set_aribb24_id3_stream(PESContext *pes)
+{
+    AVStream *st = pes->st;
+    FFStream *sti = ffstream(st);
+
+    if (st->codecpar->codec_type != AVMEDIA_TYPE_SUBTITLE ||
+        st->codecpar->codec_id != AV_CODEC_ID_ARIB_CAPTION ||
+        st->codecpar->profile != AV_PROFILE_ARIB_PROFILE_A) {
+        st->codecpar->codec_type = AVMEDIA_TYPE_SUBTITLE;
+        st->codecpar->codec_id   = AV_CODEC_ID_ARIB_CAPTION;
+        st->codecpar->codec_tag  = 0;
+        st->codecpar->profile    = AV_PROFILE_ARIB_PROFILE_A;
+        sti->need_context_update = 1;
+        st->disposition         |= AV_DISPOSITION_CAPTIONS;
+        av_dict_set(&st->metadata, "title", "ARIB Caption / Superimpose", 0);
+    }
+    sti->request_probe = 0;
+    sti->need_parsing  = 0;
+}
+
+static int handle_aribb24_id3(PESContext *pes, AVPacket *pkt)
+{
+    if (!pes->id3_arib &&
+        pes->st->codecpar->codec_id != AV_CODEC_ID_TIMED_ID3)
+        return 0;
+
+    if (unwrap_aribb24_id3(pkt)) {
+        pes->id3_arib = 1;
+        set_aribb24_id3_stream(pes);
+        return 1;
+    }
+
+    if (pes->id3_arib) {
+        av_log(pes->stream, AV_LOG_WARNING,
+               "Dropping non-ARIB ID3 packet from an ARIB caption stream\n");
+        av_shrink_packet(pkt, 0);
+        pes->flags |= AV_PKT_FLAG_CORRUPT;
+    }
+    return 0;
+}
+
 static int new_pes_packet(PESContext *pes, AVPacket *pkt)
 {
     uint8_t *sd;
@@ -1084,6 +1190,8 @@ static int new_pes_packet(PESContext *pes, AVPacket *pkt)
         av_log(pes->stream, AV_LOG_WARNING, "PES packet size mismatch\n");
         pes->flags |= AV_PKT_FLAG_CORRUPT;
     }
+
+    handle_aribb24_id3(pes, pkt);
 
     // JPEG-XS PES payload
     if (pes->stream_id == 0xbd && pes->stream_type == STREAM_TYPE_VIDEO_JPEGXS &&
