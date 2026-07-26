@@ -838,6 +838,30 @@ Set the sample rate for libopenmpt to output.
 Range is from 1000 to INT_MAX. The value default is 48000.
 @end table
 
+@section mmttlv
+
+Demuxer for MMT protocol over TLV packets (MMT/TLV). The MMT transport is
+defined in ARIB STD-B60 and the TLV packet framing in ARIB STD-B32.
+Uncompressed IPv4/IPv6 UDP packets and all ARIB compressed-header context types
+@code{0x20}, @code{0x21}, @code{0x60}, and @code{0x61} are accepted.
+NTP contexts are identified from their full compressed headers and ignored
+together with their subsequent compressed packets.
+The demuxer supports H.264/AVC, HEVC, AAC-LATM, raw AAC, raw MPEG-4 ALS,
+and @code{stpp} assets carrying uncompressed ARIB-TTML text subtitles.
+Unsupported audio and subtitle combinations are exposed as binary-data
+streams instead of being discarded.
+Application and general-data assets @code{aapp}, @code{asgd}, and @code{aagd}
+are emitted as binary-data streams while preserving each MFU boundary,
+including aggregated MFUs. Packet strings metadata contains
+@code{mmt.packet_id}, @code{mmt.mpu_sequence_number}, and @code{mmt.timed}.
+Timed MFUs also contain @code{mmt.movie_fragment_sequence_number},
+@code{mmt.sample_number}, @code{mmt.offset}, @code{mmt.priority}, and
+@code{mmt.dependency_counter}; non-timed MFUs contain @code{mmt.item_id}.
+ARIB-TTML resource MFUs are emitted on a dependent binary-data stream with
+@code{mmt.subtitle.*} packet metadata. Unknown asset types, unparsed MMTP
+payloads, MPU metadata, and FEC repair payloads are preserved on binary-data
+streams. TLV-SI packets are exposed in the same way.
+
 @anchor{mccdec}
 @section mcc
 
@@ -977,6 +1001,10 @@ ffmpeg -activation_bytes 1CEB00DA -i test.aax -vn -c:a copy output.mp4
 @section mpegts
 
 MPEG-2 transport stream demuxer.
+
+The demuxer recognizes ARIB STD-B24 caption and superimpose data wrapped in an
+ID3 @code{PRIV} frame owned by @code{aribb24.js}. Such streams are exposed as
+ARIB caption subtitle streams instead of timed metadata.
 
 This demuxer accepts the following options:
 @table @option

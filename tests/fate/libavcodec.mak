@@ -119,5 +119,10 @@ FATE_LIBAVCODEC-yes += fate-libavcodec-htmlsubtitles
 fate-libavcodec-htmlsubtitles: libavcodec/tests/htmlsubtitles$(EXESUF)
 fate-libavcodec-htmlsubtitles: CMD = run libavcodec/tests/htmlsubtitles$(EXESUF)
 
+FATE_LIBAVCODEC-$(CONFIG_TTML_DECODER) += fate-libavcodec-ttml
+fate-libavcodec-ttml: libavcodec/tests/ttml$(EXESUF)
+fate-libavcodec-ttml: CMD = run libavcodec/tests/ttml$(EXESUF)
+fate-libavcodec-ttml: CMP = null
+
 FATE-$(CONFIG_AVCODEC) += $(FATE_LIBAVCODEC-yes)
 fate-libavcodec: $(FATE_LIBAVCODEC-yes)
