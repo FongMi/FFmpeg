@@ -2,6 +2,12 @@ The last version increases of all libraries were on 2026-06-23.
 
 API changes, most recent first:
 
+2026-08-09 - xxxxxxxxxx - lavc 63.3.100 - mediacodec.h
+  Add av_mediacodec_release_buffer_status().
+
+2026-08-09 - xxxxxxxxxx - lavc 63.2.100 - mediacodec.h
+  Add av_mediacodec_get_buffer_timestamp().
+
 2026-06-23 - 61693f6c35f - lavu 60.34.100 - hwcontext_vulkan.h
   Switch AVVkFrame.access to VkAccessFlagBits2.
 
