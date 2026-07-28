@@ -11165,10 +11165,9 @@ static int mov_parse_dovi_streams(AVFormatContext *s)
 
     /* Identify legacy dual-track Dolby Vision profile 7 carriage per Annex
      * C of "Dolby Vision Streams Within the ISO Base Media File Format",
-     * v2.7.1. The 'vdep' track reference type is shared with depth video
-     * and multi-view dependencies. The spec-mandated DV-specific sample
-     * entry combined with the dvcC configuration record disambiguates
-     * those uses. */
+     * v2.7.1. Accept legacy HEVC sample entries when the vdep reference and
+     * Dolby Vision configuration unambiguously identify the enhancement
+     * layer. */
     for (int i = 0; i < s->nb_streams; i++) {
         AVStreamGroup *stg;
         AVStream *st = s->streams[i];
@@ -11179,10 +11178,6 @@ static int mov_parse_dovi_streams(AVFormatContext *s)
         const AVDOVIDecoderConfigurationRecord *dovi;
 
         if (st->codecpar->codec_id != AV_CODEC_ID_HEVC || !tag)
-            continue;
-
-        if (st->codecpar->codec_tag != MKTAG('d','v','h','e') &&
-            st->codecpar->codec_tag != MKTAG('d','v','h','1'))
             continue;
 
         sd = av_packet_side_data_get(st->codecpar->coded_side_data,
