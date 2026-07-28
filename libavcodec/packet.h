@@ -394,6 +394,8 @@ enum AVPacketSideDataType {
     AV_PKT_DATA_NB
 };
 
+#define AV_HAVE_HEVC_CONF_SIDE_DATA 1
+
 /**
  * This structure stores auxiliary information for decoding, presenting, or
  * otherwise processing the coded stream. It is typically exported by demuxers
