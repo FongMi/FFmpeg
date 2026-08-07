@@ -503,6 +503,20 @@ static MediaCodecPacketProps *mediacodec_packet_props_take(MediaCodecDecContext 
     return NULL;
 }
 
+static bool mediacodec_packet_props_has_side_data(const MediaCodecPacketProps *props,
+                                                  enum AVFrameSideDataType type)
+{
+    if (!props)
+        return false;
+
+    for (int i = 0; i < props->nb_side_data; i++) {
+        if (props->side_data[i]->type == type)
+            return true;
+    }
+
+    return false;
+}
+
 static void ff_mediacodec_dec_ref(MediaCodecDecContext *s)
 {
     atomic_fetch_add(&s->refcount, 1);
@@ -1637,6 +1651,18 @@ int ff_mediacodec_dec_receive(AVCodecContext *avctx, MediaCodecDecContext *s,
                 mediacodec_packet_props_take(s, info.presentationTimeUs);
             FFAMediaFormat *buffer_format = NULL;
             FFAMediaFormat *frame_format = s->format;
+
+            if (s->require_dovi_mapping &&
+                !mediacodec_packet_props_has_side_data(
+                    props, AV_FRAME_DATA_DOVI_METADATA)) {
+                av_log(avctx, AV_LOG_ERROR,
+                       "MediaCodec output at ts=%"PRId64 " has no Dolby Vision "
+                       "metadata required for GPU mapping\n",
+                       info.presentationTimeUs);
+                ff_AMediaCodec_releaseOutputBuffer(codec, index, 0);
+                mediacodec_packet_props_free(&props);
+                return AVERROR_INVALIDDATA;
+            }
 
             if (avctx->codec_type == AVMEDIA_TYPE_VIDEO &&
                 mediacodec_may_use_hdr10_metadata(avctx, s)) {

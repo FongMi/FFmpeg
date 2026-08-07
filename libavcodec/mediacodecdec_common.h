@@ -74,6 +74,7 @@ typedef struct MediaCodecDecContext {
 
     bool use_ndk_codec;
     bool native_dovi;
+    bool require_dovi_mapping;
 
     MediaCodecPacketProps *packet_props_head;
     MediaCodecPacketProps *packet_props_tail;
