@@ -65,6 +65,7 @@ typedef struct MediaCodecH264DecContext {
     // Ref. MediaFormat KEY_OPERATING_RATE
     int operating_rate;
     int dovi_sink_support;
+    int dovi_gpu_mapping_support;
 
 #if CONFIG_HEVC_MEDIACODEC_DECODER
     HEVCParamSets hevc_ps;
@@ -326,6 +327,7 @@ static int mediacodec_extract_hevc_metadata(AVCodecContext *avctx,
     H2645NAL *rpu_nal = NULL;
     const uint8_t *side_data;
     size_t side_data_size;
+    bool require_dovi_mapping;
     int ret;
 
     av_frame_unref(frame);
@@ -340,6 +342,17 @@ static int mediacodec_extract_hevc_metadata(AVCodecContext *avctx,
                                         &side_data_size);
     if (side_data && side_data_size >= sizeof(s->dovi_ctx.cfg))
         memcpy(&s->dovi_ctx.cfg, side_data, sizeof(s->dovi_ctx.cfg));
+
+    if (s->dovi_ctx.cfg.dv_profile == 5) {
+        if (s->dovi_gpu_mapping_support != 1) {
+            av_log(avctx, AV_LOG_ERROR,
+                   "Dolby Vision profile 5 discovered after decoder "
+                   "initialization, but GPU mapping is unavailable\n");
+            return AVERROR(ENOSYS);
+        }
+        s->ctx->require_dovi_mapping = true;
+    }
+    require_dovi_mapping = s->ctx->require_dovi_mapping;
 
     /* Well-described SDR and HLG streams do not carry the PQ/Dolby metadata
      * exported here. Avoid scanning their compressed access units. */
@@ -356,6 +369,12 @@ static int mediacodec_extract_hevc_metadata(AVCodecContext *avctx,
     if (ret < 0) {
         if (ret == AVERROR(ENOMEM))
             return ret;
+        if (require_dovi_mapping) {
+            av_log(avctx, AV_LOG_ERROR,
+                   "Could not inspect HEVC metadata required for Dolby Vision "
+                   "GPU mapping: %s\n", av_err2str(ret));
+            return ret;
+        }
         av_log(avctx, AV_LOG_DEBUG,
                "Could not inspect HEVC metadata NAL units: %s\n",
                av_err2str(ret));
@@ -403,6 +422,12 @@ static int mediacodec_extract_hevc_metadata(AVCodecContext *avctx,
     if (ret < 0)
         return ret;
 
+    if (require_dovi_mapping && !rpu_nal) {
+        av_log(avctx, AV_LOG_ERROR,
+               "Dolby Vision profile 5 frame has no RPU for required GPU mapping\n");
+        return AVERROR_INVALIDDATA;
+    }
+
     if (s->hevc_sei.common.itut_t35.hdr_plus) {
         AVBufferRef *info =
             av_buffer_ref(s->hevc_sei.common.itut_t35.hdr_plus);
@@ -439,6 +464,12 @@ static int mediacodec_extract_hevc_metadata(AVCodecContext *avctx,
             av_buffer_unref(&rpu);
             if (ret == AVERROR(ENOMEM))
                 return ret;
+            if (require_dovi_mapping) {
+                av_log(avctx, AV_LOG_ERROR,
+                       "Invalid Dolby Vision RPU required for GPU mapping: %s\n",
+                       av_err2str(ret));
+                return ret;
+            }
             av_log(avctx, AV_LOG_WARNING,
                    "Ignoring invalid Dolby Vision RPU: %s\n",
                    av_err2str(ret));
@@ -524,6 +555,13 @@ static int mediacodec_dovi_has_compatible_base_layer(
     default:
         return 0;
     }
+}
+
+static int mediacodec_dovi_can_gpu_map(
+    AVCodecContext *avctx,
+    const AVDOVIDecoderConfigurationRecord *dovi)
+{
+    return avctx->codec_id == AV_CODEC_ID_HEVC && dovi->dv_profile == 5;
 }
 
 static av_cold int mediacodec_init_decoder(AVCodecContext *avctx,
@@ -713,26 +751,38 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
     decoder_dovi = dovi;
 
     /* Native Dolby Vision is safe only when the caller has positively
-     * identified a compatible output sink. An unspecified sink must not send
-     * profile 5, which has no compatible base layer, to a regular surface. */
+     * identified a compatible output sink. Raw profile 5 may instead use the
+     * regular HEVC decoder only when the caller can preserve its samples and
+     * apply the parsed RPU metadata in a GPU renderer. */
     if (dovi && s->dovi_sink_support != 1) {
         if (!mediacodec_dovi_has_compatible_base_layer(avctx, dovi)) {
-            av_log(avctx, AV_LOG_WARNING,
-                   "Native Dolby Vision output is unavailable and profile %u "
-                   "has no compatible base layer; refusing MediaCodec\n",
+            if (s->dovi_gpu_mapping_support != 1 ||
+                !mediacodec_dovi_can_gpu_map(avctx, dovi)) {
+                av_log(avctx, AV_LOG_WARNING,
+                       "Native Dolby Vision output is unavailable and profile %u "
+                       "cannot use the active GPU mapping path; refusing MediaCodec\n",
+                       dovi->dv_profile);
+                return AVERROR(ENOSYS);
+            }
+            av_log(avctx, AV_LOG_INFO,
+                   "Native Dolby Vision output is unavailable, decoding raw "
+                   "profile 5 for GPU mapping\n");
+        } else {
+            av_log(avctx, AV_LOG_INFO,
+                   "Native Dolby Vision output is unavailable, using the "
+                   "base-layer decoder for profile %u\n",
                    dovi->dv_profile);
-            return AVERROR(ENOSYS);
         }
-        av_log(avctx, AV_LOG_INFO,
-               "Native Dolby Vision output is unavailable, using the "
-               "base-layer decoder for profile %u\n",
-               dovi->dv_profile);
         decoder_dovi = NULL;
     }
 
     ret = mediacodec_init_decoder(avctx, s, decoder_dovi);
     if (ret < 0)
         goto fail;
+
+    s->ctx->require_dovi_mapping =
+        !s->ctx->native_dovi && s->dovi_gpu_mapping_support == 1 && dovi &&
+        mediacodec_dovi_can_gpu_map(avctx, dovi);
 
 #if CONFIG_HEVC_MEDIACODEC_DECODER
     if (avctx->codec_id == AV_CODEC_ID_HEVC && !s->ctx->native_dovi) {
@@ -871,8 +921,11 @@ static int mediacodec_receive_frame(AVCodecContext *avctx, AVFrame *frame)
             ret = mediacodec_extract_hevc_metadata(avctx, s,
                                                    &s->buffered_pkt,
                                                    s->buffered_frame_props);
-            if (ret < 0)
+            if (ret < 0) {
+                av_packet_unref(&s->buffered_pkt);
+                av_frame_unref(s->buffered_frame_props);
                 return ret;
+            }
         }
 #endif
     }
@@ -923,6 +976,9 @@ static const AVOption ff_mediacodec_vdec_options[] = {
     { "dovi_sink_support", "Whether the output sink positively supports native Dolby Vision "
                            "(-1 unspecified, 0 no, 1 yes); only 1 enables native output",
             OFFSET(dovi_sink_support), AV_OPT_TYPE_BOOL, {.i64 = -1}, -1, 1, VD },
+    { "dovi_gpu_mapping_support", "Whether the output path can preserve raw Dolby Vision "
+                                  "samples and apply parsed metadata on the GPU",
+            OFFSET(dovi_gpu_mapping_support), AV_OPT_TYPE_BOOL, {.i64 = -1}, -1, 1, VD },
     { NULL }
 };
 
