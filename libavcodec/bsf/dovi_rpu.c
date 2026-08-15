@@ -40,7 +40,92 @@ typedef struct DoviRpuContext {
 
     int strip;
     int compression;
+    int conversion;
 } DoviRpuContext;
+
+enum DoviRpuConversion {
+    DOVI_RPU_CONVERSION_NONE,
+    DOVI_RPU_CONVERSION_P81,
+};
+
+static int is_fel_mapping(const AVDOVIRpuDataHeader *header,
+                          const AVDOVIDataMapping *mapping)
+{
+    uint64_t one;
+
+    if (mapping->nlq_method_idc != AV_DOVI_NLQ_LINEAR_DZ ||
+        header->coef_log2_denom >= 63)
+        return 0;
+
+    one = UINT64_C(1) << header->coef_log2_denom;
+    for (int i = 0; i < 3; i++) {
+        const AVDOVINLQParams *nlq = &mapping->nlq[i];
+
+        if (nlq->nlq_offset || nlq->vdr_in_max != one ||
+            nlq->linear_deadzone_slope || nlq->linear_deadzone_threshold)
+            return 1;
+    }
+
+    return 0;
+}
+
+static int convert_metadata_to_p81(AVDOVIMetadata *metadata)
+{
+    AVDOVIRpuDataHeader *header = av_dovi_get_header(metadata);
+    AVDOVIDataMapping *mapping = av_dovi_get_mapping(metadata);
+    AVDOVIColorMetadata *color = av_dovi_get_color(metadata);
+    int is_fel = is_fel_mapping(header, mapping);
+
+    if (header->coef_log2_denom >= 63)
+        return AVERROR_INVALIDDATA;
+
+    header->el_spatial_resampling_filter_flag = 0;
+    header->disable_residual_flag = 1;
+
+    mapping->nlq_method_idc = AV_DOVI_NLQ_NONE;
+    mapping->num_x_partitions = 1;
+    mapping->num_y_partitions = 1;
+    memset(mapping->nlq, 0, sizeof(mapping->nlq));
+    memset(mapping->nlq_pivots, 0, sizeof(mapping->nlq_pivots));
+
+    if (is_fel) {
+        for (int i = 0; i < 3; i++) {
+            AVDOVIReshapingCurve *curve = &mapping->curves[i];
+
+            memset(curve, 0, sizeof(*curve));
+            curve->num_pivots = 2;
+            curve->pivots[1] = 1023;
+            curve->mapping_idc[0] = AV_DOVI_MAPPING_POLYNOMIAL;
+            curve->poly_order[0] = 1;
+            curve->poly_coef[0][1] = INT64_C(1) << header->coef_log2_denom;
+        }
+    }
+
+    color->ycc_to_rgb_matrix[0] = av_make_q( 9574, 8192);
+    color->ycc_to_rgb_matrix[1] = av_make_q(    0, 8192);
+    color->ycc_to_rgb_matrix[2] = av_make_q(13802, 8192);
+    color->ycc_to_rgb_matrix[3] = av_make_q( 9574, 8192);
+    color->ycc_to_rgb_matrix[4] = av_make_q(-1540, 8192);
+    color->ycc_to_rgb_matrix[5] = av_make_q(-5348, 8192);
+    color->ycc_to_rgb_matrix[6] = av_make_q( 9574, 8192);
+    color->ycc_to_rgb_matrix[7] = av_make_q(17610, 8192);
+    color->ycc_to_rgb_matrix[8] = av_make_q(    0, 8192);
+    color->ycc_to_rgb_offset[0] = av_make_q( 16777216, 1 << 28);
+    color->ycc_to_rgb_offset[1] = av_make_q(134217728, 1 << 28);
+    color->ycc_to_rgb_offset[2] = av_make_q(134217728, 1 << 28);
+    color->rgb_to_lms_matrix[0] = av_make_q( 7222, 16384);
+    color->rgb_to_lms_matrix[1] = av_make_q( 8771, 16384);
+    color->rgb_to_lms_matrix[2] = av_make_q(  390, 16384);
+    color->rgb_to_lms_matrix[3] = av_make_q( 2654, 16384);
+    color->rgb_to_lms_matrix[4] = av_make_q(12430, 16384);
+    color->rgb_to_lms_matrix[5] = av_make_q( 1300, 16384);
+    color->rgb_to_lms_matrix[6] = av_make_q(    0, 16384);
+    color->rgb_to_lms_matrix[7] = av_make_q(  422, 16384);
+    color->rgb_to_lms_matrix[8] = av_make_q(15962, 16384);
+    color->signal_color_space = 0;
+
+    return 0;
+}
 
 static int update_rpu(AVBSFContext *bsf, const AVPacket *pkt, int flags,
                       const uint8_t *rpu, size_t rpu_size,
@@ -66,6 +151,15 @@ static int update_rpu(AVBSFContext *bsf, const AVPacket *pkt, int flags,
         return ret;
     }
 
+    if (s->conversion == DOVI_RPU_CONVERSION_P81) {
+        ret = convert_metadata_to_p81(metadata);
+        if (ret < 0) {
+            av_free(metadata);
+            ff_dovi_ctx_flush(&s->dec);
+            return ret;
+        }
+    }
+
     if (pkt && !(pkt->flags & AV_PKT_FLAG_KEY))
         flags |= FF_DOVI_COMPRESS_RPU;
     ret = ff_dovi_rpu_generate(&s->enc, metadata, flags, out_rpu, out_size);
@@ -76,27 +170,17 @@ static int update_rpu(AVBSFContext *bsf, const AVPacket *pkt, int flags,
     return ret;
 }
 
-static int dovi_rpu_update_fragment_hevc(AVBSFContext *bsf, AVPacket *pkt,
-                                         CodedBitstreamFragment *au)
+static int update_hevc_rpu(AVBSFContext *bsf, AVPacket *pkt,
+                           CodedBitstreamUnit *nal)
 {
-    DoviRpuContext *s = bsf->priv_data;
-    CodedBitstreamUnit *nal = au->nb_units ? &au->units[au->nb_units - 1] : NULL;
     uint8_t *rpu = NULL;
     int rpu_size, ret;
 
-    // HEVC_NAL_UNSPEC62 is Dolby Vision RPU and HEVC_NAL_UNSPEC63 is Dolby Vision EL
-    if (!nal || (nal->type != HEVC_NAL_UNSPEC62 && nal->type != HEVC_NAL_UNSPEC63))
-        return 0;
+    if (nal->data_size < 2)
+        return AVERROR_INVALIDDATA;
 
-    if (s->strip) {
-        ff_cbs_delete_unit(au, au->nb_units - 1);
-        return 0;
-    }
-
-    if (nal->type == HEVC_NAL_UNSPEC63)
-        return 0;
-
-    ret = update_rpu(bsf, pkt, 0, nal->data + 2, nal->data_size - 2, &rpu, &rpu_size);
+    ret = update_rpu(bsf, pkt, 0, nal->data + 2, nal->data_size - 2,
+                     &rpu, &rpu_size);
     if (ret < 0)
         return ret;
     if (!rpu || rpu_size <= 0)
@@ -122,6 +206,43 @@ static int dovi_rpu_update_fragment_hevc(AVBSFContext *bsf, AVPacket *pkt,
         nal->data_size = rpu_size + 3;
         nal->data_ref = ref;
         nal->data_bit_padding = 0;
+    }
+
+    return 0;
+}
+
+static int dovi_rpu_update_fragment_hevc(AVBSFContext *bsf, AVPacket *pkt,
+                                         CodedBitstreamFragment *au)
+{
+    DoviRpuContext *s = bsf->priv_data;
+
+    // Preserve the existing last-NAL behavior unless profile conversion is requested.
+    if (s->conversion == DOVI_RPU_CONVERSION_NONE) {
+        CodedBitstreamUnit *nal = au->nb_units ? &au->units[au->nb_units - 1] : NULL;
+
+        // HEVC_NAL_UNSPEC62 is Dolby Vision RPU and HEVC_NAL_UNSPEC63 is Dolby Vision EL.
+        if (!nal || (nal->type != HEVC_NAL_UNSPEC62 && nal->type != HEVC_NAL_UNSPEC63))
+            return 0;
+        if (s->strip) {
+            ff_cbs_delete_unit(au, au->nb_units - 1);
+            return 0;
+        }
+        return nal->type == HEVC_NAL_UNSPEC62 ? update_hevc_rpu(bsf, pkt, nal) : 0;
+    }
+
+    for (int i = 0; i < au->nb_units;) {
+        CodedBitstreamUnit *nal = &au->units[i];
+
+        if (nal->type == HEVC_NAL_UNSPEC63) {
+            ff_cbs_delete_unit(au, i);
+            continue;
+        }
+        if (nal->type == HEVC_NAL_UNSPEC62) {
+            int ret = update_hevc_rpu(bsf, pkt, nal);
+            if (ret < 0)
+                return ret;
+        }
+        i++;
     }
 
     return 0;
@@ -202,6 +323,16 @@ static int dovi_rpu_init(AVBSFContext *bsf)
     s->dec.logctx = s->enc.logctx = bsf;
     s->enc.enable = 1;
 
+    if (s->strip && s->conversion != DOVI_RPU_CONVERSION_NONE) {
+        av_log(bsf, AV_LOG_ERROR, "strip and conversion cannot be enabled together.\n");
+        return AVERROR(EINVAL);
+    }
+    if (s->conversion == DOVI_RPU_CONVERSION_P81 &&
+        bsf->par_in->codec_id != AV_CODEC_ID_HEVC) {
+        av_log(bsf, AV_LOG_ERROR, "Profile 8.1 conversion requires HEVC input.\n");
+        return AVERROR(EINVAL);
+    }
+
     if (s->compression == AV_DOVI_COMPRESSION_RESERVED) {
         av_log(bsf, AV_LOG_ERROR, "Invalid compression level: %d\n", s->compression);
         return AVERROR(EINVAL);
@@ -219,12 +350,33 @@ static int dovi_rpu_init(AVBSFContext *bsf)
 
         if (sd) {
             AVDOVIDecoderConfigurationRecord *cfg;
+
+            if (sd->size < sizeof(*cfg)) {
+                av_log(bsf, AV_LOG_ERROR,
+                       "Invalid Dolby Vision configuration record.\n");
+                return AVERROR_INVALIDDATA;
+            }
             cfg = (AVDOVIDecoderConfigurationRecord *) sd->data;
             s->dec.cfg = *cfg;
 
+            if (s->conversion == DOVI_RPU_CONVERSION_P81) {
+                if (cfg->dv_profile != 7 || !cfg->rpu_present_flag ||
+                    !cfg->bl_present_flag) {
+                    av_log(bsf, AV_LOG_ERROR,
+                           "Profile 8.1 conversion requires profile 7 with RPU and base layer.\n");
+                    return AVERROR(EINVAL);
+                }
+                cfg->dv_profile = 8;
+                cfg->rpu_present_flag = 1;
+                cfg->el_present_flag = 0;
+                cfg->bl_present_flag = 1;
+                cfg->dv_bl_signal_compatibility_id = 1;
+            }
+
             /* Update configuration record before setting to enc ctx */
             cfg->dv_md_compression = s->compression;
-            if (s->compression && s->dec.cfg.dv_profile < 8) {
+            if (s->compression && s->dec.cfg.dv_profile < 8 &&
+                s->conversion == DOVI_RPU_CONVERSION_NONE) {
                 av_log(bsf, AV_LOG_ERROR, "Invalid compression level %d for "
                        "Dolby Vision profile %d.\n", s->compression, s->dec.cfg.dv_profile);
                 return AVERROR(EINVAL);
@@ -232,6 +384,11 @@ static int dovi_rpu_init(AVBSFContext *bsf)
 
             s->enc.cfg = *cfg;
         } else {
+            if (s->conversion == DOVI_RPU_CONVERSION_P81) {
+                av_log(bsf, AV_LOG_ERROR,
+                       "Profile 8.1 conversion requires a Dolby Vision configuration record.\n");
+                return AVERROR(EINVAL);
+            }
             av_log(bsf, AV_LOG_WARNING, "No Dolby Vision configuration record "
                    "found? Generating one, but results may be invalid.\n");
             ret = ff_dovi_configure_from_codedpar(&s->enc, bsf->par_out, NULL, s->compression,
@@ -242,6 +399,13 @@ static int dovi_rpu_init(AVBSFContext *bsf)
             s->dec.cfg = s->enc.cfg;
             s->dec.cfg.dv_md_compression = AV_DOVI_COMPRESSION_EXTENDED;
         }
+    }
+
+    if (s->conversion == DOVI_RPU_CONVERSION_P81) {
+        /* hvcE configures the enhancement layer removed by P8.1 conversion. */
+        av_packet_side_data_remove(bsf->par_out->coded_side_data,
+                                   &bsf->par_out->nb_coded_side_data,
+                                   AV_PKT_DATA_HEVC_CONF);
     }
 
     switch (bsf->par_in->codec_id) {
@@ -266,6 +430,14 @@ static void dovi_rpu_close(AVBSFContext *bsf)
 #define FLAGS (AV_OPT_FLAG_VIDEO_PARAM|AV_OPT_FLAG_BSF_PARAM)
 static const AVOption dovi_rpu_options[] = {
     { "strip",          "Strip Dolby Vision metadata",  OFFSET(strip),       AV_OPT_TYPE_BOOL,  { .i64 = 0 }, 0, 1, FLAGS },
+    { "convert",        "Dolby Vision profile conversion", OFFSET(conversion), AV_OPT_TYPE_INT,
+                        { .i64 = DOVI_RPU_CONVERSION_NONE }, DOVI_RPU_CONVERSION_NONE,
+                        DOVI_RPU_CONVERSION_P81, FLAGS, .unit = "conversion" },
+        { "none",       "Do not convert the profile", 0, AV_OPT_TYPE_CONST,
+                        { .i64 = DOVI_RPU_CONVERSION_NONE }, .flags = FLAGS, .unit = "conversion" },
+        { "p81",        "Convert profile 7 to profile 8.1 and discard the enhancement layer",
+                        0, AV_OPT_TYPE_CONST, { .i64 = DOVI_RPU_CONVERSION_P81 },
+                        .flags = FLAGS, .unit = "conversion" },
     { "compression",    "DV metadata compression mode", OFFSET(compression), AV_OPT_TYPE_INT,   { .i64 = AV_DOVI_COMPRESSION_LIMITED }, 0, AV_DOVI_COMPRESSION_EXTENDED, FLAGS, .unit = "compression" },
         { "none",       "Don't compress metadata",      0, AV_OPT_TYPE_CONST, {.i64 = 0},                            .flags = FLAGS, .unit = "compression" },
         { "limited",    "Limited metadata compression", 0, AV_OPT_TYPE_CONST, {.i64 = AV_DOVI_COMPRESSION_LIMITED},  .flags = FLAGS, .unit = "compression" },
