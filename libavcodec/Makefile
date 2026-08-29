@@ -14,6 +14,7 @@ HEADERS = ac3_parser.h                                                  \
           defs.h                                                        \
           dirac.h                                                       \
           dv_profile.h                                                  \
+          dovi_rpu_parser.h                                             \
           dxva2.h                                                       \
           exif.h                                                        \
           jni.h                                                         \
@@ -41,6 +42,7 @@ OBJS = ac3_parser.o                                                     \
        d3d11va.o                                                        \
        decode.o                                                         \
        dirac.o                                                          \
+       dovi_rpu_parser.o                                                \
        dv_profile.o                                                     \
        encode.o                                                         \
        exif.o                                                           \
