@@ -88,6 +88,41 @@ static void libarcdav3a_set_channel_layout(AVChannelLayout *layout,
     av_channel_layout_default(layout, channels);
 }
 
+static int libarcdav3a_get_output_channels(const AVS3DecoderHandle decoder)
+{
+    /* The reference decoder exposes sound-bed and object signals as separate
+     * interleaved channels, but does not render the objects to speakers. */
+    if (decoder->isMixedContent && decoder->soundBedType == 1 &&
+        decoder->numObjsOutput > 0 &&
+        decoder->numObjsOutput < decoder->numChansOutput)
+        return decoder->numChansOutput - decoder->numObjsOutput;
+
+    return decoder->numChansOutput;
+}
+
+static int libarcdav3a_keep_sound_bed(uint8_t *data, int size,
+                                     int decoded_channels, int output_channels)
+{
+    int16_t *samples = (int16_t *)data;
+    int sample_count;
+
+    if (decoded_channels <= 0 || output_channels <= 0 ||
+        output_channels > decoded_channels ||
+        size % (decoded_channels * (int)sizeof(*samples)))
+        return AVERROR_INVALIDDATA;
+
+    if (output_channels == decoded_channels)
+        return size;
+
+    sample_count = size / (decoded_channels * (int)sizeof(*samples));
+    for (int i = 1; i < sample_count; i++)
+        memmove(samples + i * output_channels,
+                samples + i * decoded_channels,
+                output_channels * sizeof(*samples));
+
+    return sample_count * output_channels * sizeof(*samples);
+}
+
 static int libarcdav3a_append_input(LibARCDAV3AContext *s,
                                     const uint8_t *input, int input_size)
 {
@@ -265,22 +300,28 @@ static int libarcdav3a_decode_buffer(AVCodecContext *avctx, const uint8_t *input
 
             if (ret != AVS3_TRUE)
                 break;
+            if (out_len <= 0)
+                break;
+
+            out_len = libarcdav3a_keep_sound_bed(
+                output->data + out_index, out_len,
+                s->decoder->numChansOutput,
+                libarcdav3a_get_output_channels(s->decoder));
+            if (out_len < 0)
+                return out_len;
 
             s->last_channel_config = s->decoder->channelNumConfig;
             s->last_object_count   = s->decoder->numObjsOutput;
             s->last_mix_type       = s->decoder->isMixedContent;
             s->last_total_bitrate  = s->decoder->totalBitrate;
 
-            if (out_len > 0)
-                out_index += out_len;
-            else
-                break;
+            out_index += out_len;
         }
     } while (s->buffered_size > pos);
 
     if (out_index) {
         output->size           = out_index;
-        output->channels       = s->decoder->numChansOutput;
+        output->channels       = libarcdav3a_get_output_channels(s->decoder);
         output->sample_rate    = s->decoder->outputFs;
         output->channel_config = s->decoder->channelNumConfig;
         s->decoder->numObjsOutput = 0;
