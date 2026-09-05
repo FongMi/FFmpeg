@@ -301,6 +301,33 @@ static void build_matrix(const AVChannelLayout *in_ch_layout, const AVChannelLay
             av_assert0(0);
     }
 
+    for (i = 0; i < 2; i++) {
+        int top = i ? TOP_BACK_RIGHT : TOP_BACK_LEFT;
+        int back = i ? BACK_RIGHT : BACK_LEFT;
+        int side = i ? SIDE_RIGHT : SIDE_LEFT;
+        int front = i ? FRONT_RIGHT : FRONT_LEFT;
+        double surround = surround_mix_level * M_SQRT1_2;
+        if (!(unaccounted & (1ULL << top)))
+            continue;
+        if (av_channel_layout_index_from_channel(out_ch_layout, back) >= 0) {
+            matrix[back][top] += M_SQRT1_2;
+        } else if (av_channel_layout_index_from_channel(out_ch_layout, side) >= 0) {
+            matrix[side][top] += M_SQRT1_2;
+        } else if (av_channel_layout_index_from_channel(out_ch_layout, front) >= 0) {
+            if (matrix_encoding == AV_MATRIX_ENCODING_DOLBY) {
+                matrix[FRONT_LEFT ][top] -= surround * M_SQRT1_2;
+                matrix[FRONT_RIGHT][top] += surround * M_SQRT1_2;
+            } else if (matrix_encoding == AV_MATRIX_ENCODING_DPLII) {
+                matrix[FRONT_LEFT ][top] -= surround * (i ? M_SQRT1_2 : SQRT3_2);
+                matrix[FRONT_RIGHT][top] += surround * (i ? SQRT3_2 : M_SQRT1_2);
+            } else {
+                matrix[front][top] += surround;
+            }
+        } else if (av_channel_layout_index_from_channel(out_ch_layout, AV_CHAN_FRONT_CENTER) >= 0) {
+            matrix[FRONT_CENTER][top] += surround;
+        }
+    }
+
     /* mix LFE into front left/right or center */
     if (unaccounted & AV_CH_LOW_FREQUENCY) {
         if (av_channel_layout_index_from_channel(out_ch_layout, AV_CHAN_FRONT_CENTER) >= 0) {
