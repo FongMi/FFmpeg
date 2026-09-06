@@ -56,6 +56,11 @@ fate-hls_timestamp: libavformat/tests/hls_timestamp$(EXESUF)
 fate-hls_timestamp: CMD = run libavformat/tests/hls_timestamp$(EXESUF)
 fate-hls_timestamp: CMP = null
 
+FATE_LIBAVFORMAT-$(CONFIG_DASH_DEMUXER) += fate-dash
+fate-dash: libavformat/tests/dash$(EXESUF)
+fate-dash: CMD = run libavformat/tests/dash$(EXESUF)
+fate-dash: CMP = null
+
 FATE_LIBAVFORMAT += $(FATE_LIBAVFORMAT-yes)
 FATE-$(CONFIG_AVFORMAT) += $(FATE_LIBAVFORMAT)
 fate-libavformat: $(FATE_LIBAVFORMAT)
