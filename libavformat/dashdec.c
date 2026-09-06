@@ -2410,7 +2410,9 @@ static int dash_read_packet(AVFormatContext *s, AVPacket *pkt)
     if (!cur) {
         return AVERROR_EOF;
     }
-    while (!ff_check_interrupt(c->interrupt_callback) && !ret) {
+    while (!ret) {
+        if (ff_check_interrupt(c->interrupt_callback))
+            return AVERROR_EXIT;
         ret = av_read_frame(cur->ctx, pkt);
         if (ret >= 0) {
             /* If we got a packet, return it */
