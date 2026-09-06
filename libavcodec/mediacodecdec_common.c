@@ -1627,6 +1627,7 @@ int ff_mediacodec_dec_receive(AVCodecContext *avctx, MediaCodecDecContext *s,
         output_dequeue_timeout_us = 0;
     }
 
+retry:
     index = ff_AMediaCodec_dequeueOutputBuffer(codec, &info, output_dequeue_timeout_us);
     if (index >= 0) {
         av_log(avctx, AV_LOG_TRACE, "Got output buffer %zd"
@@ -1757,6 +1758,7 @@ int ff_mediacodec_dec_receive(AVCodecContext *avctx, MediaCodecDecContext *s,
             av_log(avctx, AV_LOG_ERROR, "Failed to dequeue output buffer within %" PRIi64 "ms "
                                         "while draining remaining frames, output will probably lack frames\n",
                                         output_dequeue_timeout_us / 1000);
+            return AVERROR_EXTERNAL;
         } else {
             av_log(avctx, AV_LOG_TRACE, "No output buffer available, try again later\n");
         }
@@ -1769,6 +1771,11 @@ int ff_mediacodec_dec_receive(AVCodecContext *avctx, MediaCodecDecContext *s,
         mediacodec_packet_props_clear(s);
         return AVERROR_EOF;
     }
+    /* Format/buffer changes and empty non-EOS buffers are not requests for
+     * more input. Once draining, receive must return a frame, EOF or an error,
+     * never EAGAIN: the caller has already sent its last input packet. */
+    if (s->draining)
+        goto retry;
     return AVERROR(EAGAIN);
 }
 
