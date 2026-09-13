@@ -2051,6 +2051,7 @@ EXTERNAL_LIBRARY_NONFREE_LIST="
 
 EXTERNAL_LIBRARY_VERSION3_LIST="
     gmp
+    libarcdav3a
     libaribb24
     liblensfun
     libopencore_amrnb
@@ -2077,7 +2078,6 @@ EXTERNAL_LIBRARY_LIST="
     ladspa
     lcms2
     libaom
-    libarcdav3a
     libaribcaption
     libass
     libbluray
@@ -7324,7 +7324,7 @@ enabled jni               && { [ $target_os = "android" ] && check_headers jni.h
 enabled ladspa            && require_headers "ladspa.h dlfcn.h"
 enabled lcms2             && require_pkg_config lcms2 "lcms2 >= 2.13" lcms2.h cmsCreateContext
 enabled libaom            && require_pkg_config libaom "aom >= 2.0.0" aom/aom_codec.h aom_codec_version
-enabled libarcdav3a       && require_pkg_config libarcdav3a arcdav3a decoder.h avs3_create_decoder
+enabled libarcdav3a       && require_pkg_config libarcdav3a arcdav3a "decoder.h speaker_renderer.h" "avs3_create_decoder avs3_speaker_renderer_create"
 enabled liboapv           && require_pkg_config liboapv "oapv >= 0.2.0.0" "oapv/oapv.h" oapve_encode
 enabled libaribb24        && { check_pkg_config libaribb24 "aribb24 > 1.0.3" "aribb24/aribb24.h" arib_instance_new ||
                                { enabled gpl && require_pkg_config libaribb24 aribb24 "aribb24/aribb24.h" arib_instance_new; } ||

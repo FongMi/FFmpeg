@@ -4,10 +4,12 @@
 #include <string.h>
 
 #include <decoder.h>
+#include <speaker_renderer.h>
 
 #include "libavutil/channel_layout.h"
 #include "libavutil/error.h"
 #include "libavutil/mem.h"
+#include "libavutil/opt.h"
 
 #include "avcodec.h"
 #include "codec_internal.h"
@@ -27,8 +29,12 @@ typedef struct LibARCDAV3AOutput {
 } LibARCDAV3AOutput;
 
 typedef struct LibARCDAV3AContext {
+    const AVClass *class;
     LibARCDAV3AOutput output;
     AVS3DecoderHandle decoder;
+    Avs3SpeakerRenderer *renderer;
+    int renderer_config;
+    int content_index;
     uint8_t *buffer;
     int buffer_size;
     int buffered_size;
@@ -90,8 +96,7 @@ static void libarcdav3a_set_channel_layout(AVChannelLayout *layout,
 
 static int libarcdav3a_get_output_channels(const AVS3DecoderHandle decoder)
 {
-    /* The reference decoder exposes sound-bed and object signals as separate
-     * interleaved channels, but does not render the objects to speakers. */
+    /* Mixed-content objects are rendered into the sound-bed speaker layout. */
     if (decoder->isMixedContent && decoder->soundBedType == 1 &&
         decoder->numObjsOutput > 0 &&
         decoder->numObjsOutput < decoder->numChansOutput)
@@ -100,25 +105,50 @@ static int libarcdav3a_get_output_channels(const AVS3DecoderHandle decoder)
     return decoder->numChansOutput;
 }
 
-static int libarcdav3a_keep_sound_bed(uint8_t *data, int size,
-                                     int decoded_channels, int output_channels)
+static int libarcdav3a_render_objects(AVCodecContext *avctx, uint8_t *data, int size)
 {
+    LibARCDAV3AContext *s = avctx->priv_data;
+    int decoded_channels = s->decoder->numChansOutput;
+    int output_channels = libarcdav3a_get_output_channels(s->decoder);
     int16_t *samples = (int16_t *)data;
-    int sample_count;
+    int sample_count, ret;
+    char error[256] = { 0 };
 
     if (decoded_channels <= 0 || output_channels <= 0 ||
         output_channels > decoded_channels ||
         size % (decoded_channels * (int)sizeof(*samples)))
         return AVERROR_INVALIDDATA;
 
-    if (output_channels == decoded_channels)
+    if (output_channels == decoded_channels) {
+        avs3_speaker_renderer_destroy(s->renderer);
+        s->renderer = NULL;
         return size;
+    }
 
     sample_count = size / (decoded_channels * (int)sizeof(*samples));
-    for (int i = 1; i < sample_count; i++)
-        memmove(samples + i * output_channels,
-                samples + i * decoded_channels,
-                output_channels * sizeof(*samples));
+    if (s->renderer && s->renderer_config != s->decoder->channelNumConfig) {
+        avs3_speaker_renderer_destroy(s->renderer);
+        s->renderer = NULL;
+    }
+    if (!s->renderer) {
+        ret = avs3_speaker_renderer_create(&s->renderer, s->decoder->channelNumConfig,
+                                           output_channels, s->content_index);
+        if (ret < 0) {
+            av_log(avctx, AV_LOG_ERROR, "Cannot create AV3A speaker renderer: %s\n",
+                   av_err2str(ret));
+            return ret;
+        }
+        s->renderer_config = s->decoder->channelNumConfig;
+    }
+    ret = avs3_speaker_renderer_process(s->renderer,
+                                        &s->decoder->hMetadataDec->avs3MetaData,
+                                        samples, sample_count, decoded_channels,
+                                        error, sizeof(error));
+    if (ret < 0) {
+        av_log(avctx, AV_LOG_ERROR, "Cannot render AV3A objects: %s\n",
+               error[0] ? error : av_err2str(ret));
+        return ret;
+    }
 
     return sample_count * output_channels * sizeof(*samples);
 }
@@ -178,6 +208,8 @@ static av_cold void libarcdav3a_flush(AVCodecContext *avctx)
 {
     LibARCDAV3AContext *s = avctx->priv_data;
 
+    /* Static programme metadata may occur only at the start of the stream. */
+    avs3_speaker_renderer_reset(s->renderer);
     if (s->decoder)
         avs3_destroy_decoder(s->decoder);
     s->decoder = avs3_create_decoder();
@@ -303,12 +335,21 @@ static int libarcdav3a_decode_buffer(AVCodecContext *avctx, const uint8_t *input
             if (out_len <= 0)
                 break;
 
-            out_len = libarcdav3a_keep_sound_bed(
-                output->data + out_index, out_len,
-                s->decoder->numChansOutput,
-                libarcdav3a_get_output_channels(s->decoder));
+            out_len = libarcdav3a_render_objects(avctx, output->data + out_index, out_len);
             if (out_len < 0)
                 return out_len;
+
+            if (s->decoder->channelNumConfig == CHANNEL_CONFIG_MC_7_1_4 &&
+                libarcdav3a_get_output_channels(s->decoder) == 12) {
+                /* AVS3 orders side channels before back channels; FFmpeg's
+                 * native 7.1.4 layout orders back channels before side channels. */
+                int16_t *pcm = (int16_t *)(output->data + out_index);
+                int channels = libarcdav3a_get_output_channels(s->decoder);
+                for (int i = 0; i < out_len / (channels * 2); i++) {
+                    FFSWAP(int16_t, pcm[i * channels + 4], pcm[i * channels + 6]);
+                    FFSWAP(int16_t, pcm[i * channels + 5], pcm[i * channels + 7]);
+                }
+            }
 
             s->last_channel_config = s->decoder->channelNumConfig;
             s->last_object_count   = s->decoder->numObjsOutput;
@@ -404,6 +445,8 @@ static av_cold int libarcdav3a_decode_close(AVCodecContext *avctx)
 {
     LibARCDAV3AContext *s = avctx->priv_data;
 
+    avs3_speaker_renderer_destroy(s->renderer);
+    s->renderer = NULL;
     if (s->decoder)
         avs3_destroy_decoder(s->decoder);
     s->decoder = NULL;
@@ -414,6 +457,20 @@ static av_cold int libarcdav3a_decode_close(AVCodecContext *avctx)
     return 0;
 }
 
+static const AVOption libarcdav3a_options[] = {
+    { "content_index", "Audio Vivid presentation within the audio programme",
+      offsetof(LibARCDAV3AContext, content_index), AV_OPT_TYPE_INT, { .i64 = 0 },
+      0, 3, AV_OPT_FLAG_AUDIO_PARAM | AV_OPT_FLAG_DECODING_PARAM },
+    { NULL }
+};
+
+static const AVClass libarcdav3a_class = {
+    .class_name = "libarcdav3a",
+    .item_name  = av_default_item_name,
+    .option    = libarcdav3a_options,
+    .version   = LIBAVUTIL_VERSION_INT,
+};
+
 const FFCodec ff_libarcdav3a_decoder = {
     .p.name         = "libarcdav3a",
     CODEC_LONG_NAME("libarcdav3a AV3A"),
@@ -421,6 +478,7 @@ const FFCodec ff_libarcdav3a_decoder = {
     .p.id           = AV_CODEC_ID_AV3A,
     .p.capabilities = AV_CODEC_CAP_CHANNEL_CONF | AV_CODEC_CAP_DR1,
     .p.wrapper_name = "libarcdav3a",
+    .p.priv_class   = &libarcdav3a_class,
     .priv_data_size = sizeof(LibARCDAV3AContext),
     .init           = libarcdav3a_decode_init,
     .close          = libarcdav3a_decode_close,
