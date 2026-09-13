@@ -30,6 +30,7 @@
 
 #include "libavutil/frame.h"
 #include "libavutil/pixfmt.h"
+#include "libavutil/thread.h"
 
 #include "avcodec.h"
 #include "mediacodec_wrapper.h"
@@ -41,6 +42,8 @@ typedef struct MediaCodecDecContext {
     const AVClass *avclass;
     atomic_int refcount;
     atomic_int hw_buffer_count;
+    AVMutex output_mutex;
+    bool output_mutex_initialized;
 
     char *codec_name;
 

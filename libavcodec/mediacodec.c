@@ -101,7 +101,9 @@ int av_mediacodec_release_buffer_status(AVMediaCodecBuffer *buffer, int render)
         return AVERROR(EINVAL);
 
     MediaCodecDecContext *ctx = buffer->ctx;
+    ff_mutex_lock(&ctx->output_mutex);
     int released = atomic_fetch_add(&buffer->released, 1);
+    int result = 0;
 
     if (!released && (ctx->delay_flush || buffer->serial == atomic_load(&ctx->serial))) {
         atomic_fetch_sub(&ctx->hw_buffer_count, 1);
@@ -109,10 +111,11 @@ int av_mediacodec_release_buffer_status(AVMediaCodecBuffer *buffer, int render)
                "Releasing output buffer %zd (%p) ts=%"PRId64" with render=%d [%d pending]\n",
                buffer->index, buffer, buffer->pts, render, atomic_load(&ctx->hw_buffer_count));
         int ret = ff_AMediaCodec_releaseOutputBuffer(ctx->codec, buffer->index, render);
-        return ret < 0 ? ret : 1;
+        result = ret < 0 ? ret : 1;
     }
 
-    return 0;
+    ff_mutex_unlock(&ctx->output_mutex);
+    return result;
 }
 
 int av_mediacodec_release_buffer(AVMediaCodecBuffer *buffer, int render)
@@ -124,17 +127,20 @@ int av_mediacodec_release_buffer(AVMediaCodecBuffer *buffer, int render)
 int av_mediacodec_render_buffer_at_time(AVMediaCodecBuffer *buffer, int64_t time)
 {
     MediaCodecDecContext *ctx = buffer->ctx;
+    ff_mutex_lock(&ctx->output_mutex);
     int released = atomic_fetch_add(&buffer->released, 1);
+    int result = 0;
 
     if (!released && (ctx->delay_flush || buffer->serial == atomic_load(&ctx->serial))) {
         atomic_fetch_sub(&ctx->hw_buffer_count, 1);
         av_log(ctx, AV_LOG_DEBUG,
                "Rendering output buffer %zd (%p) ts=%"PRId64" with time=%"PRId64" [%d pending]\n",
                buffer->index, buffer, buffer->pts, time, atomic_load(&ctx->hw_buffer_count));
-        return ff_AMediaCodec_releaseOutputBufferAtTime(ctx->codec, buffer->index, time);
+        result = ff_AMediaCodec_releaseOutputBufferAtTime(ctx->codec, buffer->index, time);
     }
 
-    return 0;
+    ff_mutex_unlock(&ctx->output_mutex);
+    return result;
 }
 
 #else
