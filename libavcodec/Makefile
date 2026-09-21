@@ -14,6 +14,7 @@ HEADERS = ac3_parser.h                                                  \
           defs.h                                                        \
           dirac.h                                                       \
           dv_profile.h                                                  \
+          dovi_rpu_parser.h                                             \
           dxva2.h                                                       \
           exif.h                                                        \
           jni.h                                                         \
@@ -41,6 +42,7 @@ OBJS = ac3_parser.o                                                     \
        d3d11va.o                                                        \
        decode.o                                                         \
        dirac.o                                                          \
+       dovi_rpu_parser.o                                                \
        dv_profile.o                                                     \
        encode.o                                                         \
        exif.o                                                           \
@@ -1374,6 +1376,7 @@ TESTPROGS-$(CONFIG_APV_DECODER)           += apv
 TESTPROGS-$(CONFIG_AV1_VAAPI_ENCODER)     += av1_levels
 TESTPROGS-$(CONFIG_CABAC)                 += cabac
 TESTPROGS-$(CONFIG_CELP_MATH)             += celp_math
+TESTPROGS-$(CONFIG_DOVI_RPU_BSF)          += dovi_rpu
 TESTPROGS-$(CONFIG_GOLOMB)                += golomb
 TESTPROGS-$(CONFIG_IDCTDSP)               += dct
 TESTPROGS-$(CONFIG_DXV_ENCODER)           += hashtable
@@ -1381,6 +1384,7 @@ TESTPROGS-$(CONFIG_MJPEG_ENCODER)         += mjpegenc_huffman
 TESTPROGS-$(CONFIG_MPEGVIDEO)             += mpeg12framerate
 TESTPROGS-$(CONFIG_H264_METADATA_BSF)     += h264_levels
 TESTPROGS-$(CONFIG_HEVC_METADATA_BSF)     += h265_levels
+TESTPROGS-$(CONFIG_HEVCPARSE)             += h2645_parse
 TESTPROGS-$(CONFIG_LIBARCDAV3A_DECODER)    += libarcdav3a
 TESTPROGS-$(CONFIG_RANGECODER)            += rangecoder
 TESTPROGS-$(CONFIG_SNOW_ENCODER)          += snowenc

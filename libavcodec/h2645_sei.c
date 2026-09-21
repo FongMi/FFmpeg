@@ -515,6 +515,18 @@ static int h2645_sei_to_side_data(AVCodecContext *avctx, H2645SEI *sei,
     return 0;
 }
 
+int ff_h2645_sei_hdr_to_frame(AVFrame *frame, const H2645SEI *sei,
+                              AVCodecContext *avctx)
+{
+    H2645SEI hdr = {
+        .mastering_display = sei->mastering_display,
+        .content_light     = sei->content_light,
+    };
+
+    return h2645_sei_to_side_data(avctx, &hdr,
+                                  &frame->side_data, &frame->nb_side_data);
+}
+
 int ff_h2645_sei_to_frame(AVFrame *frame, H2645SEI *sei,
                           enum AVCodecID codec_id,
                           AVCodecContext *avctx, const H2645VUI *vui,
