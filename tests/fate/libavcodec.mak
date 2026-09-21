@@ -33,6 +33,11 @@ fate-celp_math: libavcodec/tests/celp_math$(EXESUF)
 fate-celp_math: CMD = run libavcodec/tests/celp_math$(EXESUF)
 fate-celp_math: CMP = null
 
+FATE_LIBAVCODEC-$(CONFIG_DOVI_RPU_BSF) += fate-dovi-rpu
+fate-dovi-rpu: libavcodec/tests/dovi_rpu$(EXESUF)
+fate-dovi-rpu: CMD = run libavcodec/tests/dovi_rpu$(EXESUF)
+fate-dovi-rpu: CMP = null
+
 FATE_LIBAVCODEC-yes += fate-codec_desc
 fate-codec_desc: libavcodec/tests/codec_desc$(EXESUF)
 fate-codec_desc: CMD = run libavcodec/tests/codec_desc$(EXESUF)
@@ -42,6 +47,11 @@ FATE_LIBAVCODEC-$(CONFIG_GOLOMB) += fate-golomb
 fate-golomb: libavcodec/tests/golomb$(EXESUF)
 fate-golomb: CMD = run libavcodec/tests/golomb$(EXESUF)
 fate-golomb: CMP = null
+
+FATE_LIBAVCODEC-$(CONFIG_HEVCPARSE) += fate-h2645-parse
+fate-h2645-parse: libavcodec/tests/h2645_parse$(EXESUF)
+fate-h2645-parse: CMD = run libavcodec/tests/h2645_parse$(EXESUF)
+fate-h2645-parse: CMP = null
 
 FATE_LIBAVCODEC-$(CONFIG_DXV_ENCODER) += fate-hashtable
 fate-hashtable: libavcodec/tests/hashtable$(EXESUF)

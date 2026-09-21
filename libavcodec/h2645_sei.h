@@ -170,6 +170,12 @@ int ff_h2645_sei_to_frame(AVFrame *frame, H2645SEI *sei,
                           unsigned bit_depth_luma, unsigned bit_depth_chroma,
                           int seed);
 
+/**
+ * Attach only mastering-display and content-light SEI metadata to a frame.
+ */
+int ff_h2645_sei_hdr_to_frame(AVFrame *frame, const H2645SEI *sei,
+                              AVCodecContext *avctx);
+
 int ff_h2645_sei_to_context(AVCodecContext *avctx, H2645SEI *sei);
 
 #endif /* AVCODEC_H2645_SEI_H */
