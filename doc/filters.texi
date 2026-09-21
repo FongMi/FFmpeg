@@ -6202,6 +6202,11 @@ front left and right:
 pan="stereo| c0=FR | c1=FR"
 @end example
 
+@subsection Commands
+
+The filter supports the @code{remix} command. Its argument uses the same syntax
+as the filter parameters. The output channel layout must remain unchanged.
+
 @section replaygain
 
 ReplayGain scanner filter. This filter takes an audio stream as an input and
