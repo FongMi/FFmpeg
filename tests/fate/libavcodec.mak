@@ -140,6 +140,11 @@ $(FATE_SAMPLES_ENC_RECON-yes): CMP = null
 FATE_EXTERN-yes += $(FATE_SAMPLES_ENC_RECON-yes)
 fate-enc-recon: $(FATE_SAMPLES_ENC_RECON-yes)
 
+FATE_LIBAVCODEC-$(CONFIG_TTML_DECODER) += fate-libavcodec-ttml
+fate-libavcodec-ttml: libavcodec/tests/ttml$(EXESUF)
+fate-libavcodec-ttml: CMD = run libavcodec/tests/ttml$(EXESUF)
+fate-libavcodec-ttml: CMP = null
+
 FATE_LIBAVCODEC-$(CONFIG_LIBARCDAV3A_DECODER) += fate-libarcdav3a
 fate-libarcdav3a: libavcodec/tests/libarcdav3a$(EXESUF)
 fate-libarcdav3a: CMD = run libavcodec/tests/libarcdav3a$(EXESUF)
