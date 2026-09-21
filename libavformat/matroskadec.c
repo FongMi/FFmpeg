@@ -3376,6 +3376,14 @@ static int matroska_parse_dovi_streams(AVFormatContext *s)
         if (sd) {
             dovi = (const AVDOVIDecoderConfigurationRecord *)sd->data;
             if (dovi->dv_profile == 7 && dovi->el_present_flag) {
+                const AVPacketSideData *hvce =
+                    av_packet_side_data_get(st->codecpar->coded_side_data,
+                                            st->codecpar->nb_coded_side_data,
+                                            AV_PKT_DATA_HEVC_CONF);
+
+                // hvcE marks an interleaved BL+EL track, not a separate EL.
+                if (hvce)
+                    continue;
                 /* bl_present_flag is not checked, because the files in the
                  * wild set it to 1 for EL stream, while the expectation, based
                  * on Dolby spec for MPEG-TS would be that it's set to 0.
