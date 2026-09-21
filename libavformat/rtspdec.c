@@ -574,6 +574,14 @@ static int rtsp_read_play(AVFormatContext *s)
         if (reply->status_code != RTSP_STATUS_OK) {
             return ff_rtsp_averror(reply->status_code, -1);
         }
+        if ((s->ctx_flags & AVFMTCTX_LIVE) &&
+            reply->range_start != AV_NOPTS_VALUE &&
+            reply->range_end != AV_NOPTS_VALUE &&
+            reply->range_end >= reply->range_start) {
+            s->duration = reply->range_end - reply->range_start;
+            s->ctx_flags &= ~(AVFMTCTX_LIVE | AVFMTCTX_UNSEEKABLE);
+            s->ctx_flags |= AVFMTCTX_LIVE_STATUS_KNOWN;
+        }
         if (rt->transport == RTSP_TRANSPORT_RTP &&
             reply->range_start != AV_NOPTS_VALUE) {
             for (i = 0; i < rt->nb_rtsp_streams; i++) {
