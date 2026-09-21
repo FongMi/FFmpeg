@@ -27,4 +27,5 @@ SHLIBOBJS-$(HAVE_GNU_WINDRES) += swresampleres.o
 
 TESTPROGS = rematrix \
             swresample \
+            rematrix_height \
             swresample_resample_realloc \
