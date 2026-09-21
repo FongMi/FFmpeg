@@ -25,4 +25,5 @@ SHLIBOBJS              += log2_tab.o
 SHLIBOBJS-$(HAVE_GNU_WINDRES) += swresampleres.o
 
 TESTPROGS = swresample \
+            rematrix_height \
             swresample_resample_realloc \
