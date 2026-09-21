@@ -29,6 +29,8 @@
 
 #include "config_components.h"
 
+#include <stdlib.h>
+
 #include "libavformat/http.h"
 #include "libavutil/aes.h"
 #include "libavutil/avstring.h"
@@ -39,6 +41,7 @@
 #include "libavutil/opt.h"
 #include "libavutil/dict.h"
 #include "libavutil/time.h"
+#include "libavutil/thread.h"
 #include "avformat.h"
 #include "demux.h"
 #include "internal.h"
@@ -47,6 +50,8 @@
 #include "url.h"
 
 #include "hls_sample_encryption.h"
+#include "hls_ad_detect.h"
+#include "hls_ad_probe.h"
 #include "hls_timestamp.h"
 
 #define INITIAL_BUFFER_SIZE 32768
@@ -77,6 +82,9 @@ enum KeyType {
 
 struct segment {
     int64_t duration;
+    int ad_removed;
+    int discontinuity;
+    int cue_ad;
     int64_t url_offset;
     int64_t size;
     char *url;
@@ -136,6 +144,9 @@ struct playlist {
     int64_t cur_seg_offset;
     int64_t last_load_time;
     int has_discontinuity;
+    int has_cue;
+    int valid_cue;
+    int allow_repeated_ad_blocks;
 
     /* Currently active Media Initialization Section */
     struct segment *cur_init_section;
@@ -248,8 +259,20 @@ typedef struct HLSContext {
     int http_persistent;
     int http_multiple;
     int http_seekable;
+    char *ca_file;
+    int tls_verify;
     int seg_max_retry;
     AVIOContext *playlist_pb;
+    int hls_adblock;
+#if HAVE_PTHREADS
+    AVMutex ad_probe_mutex;
+    pthread_t ad_probe_thread;
+    AVDictionary *ad_probe_avio_opts;
+    uint8_t *ad_probe_confirmed;
+    int ad_probe_started;
+    int ad_probe_cancel;
+    int ad_probe_frontier;
+#endif
     HLSCryptoContext  crypto_ctx;
 } HLSContext;
 
@@ -926,6 +949,10 @@ static int parse_playlist(HLSContext *c, const char *url,
     int64_t seg_offset = 0;
     int64_t seg_size = -1;
     int discontinuity = 0;
+    int in_cue = 0;
+    int has_cue = 0;
+    int valid_cue = 1;
+    int allow_repeated_ad_blocks = 1;
     uint8_t *new_url = NULL;
     struct variant_info variant_info;
     char tmp_str[MAX_URL_SIZE];
@@ -1054,6 +1081,7 @@ static int parse_playlist(HLSContext *c, const char *url,
             else if (!strcmp(ptr, "VOD"))
                 pls->type = PLS_TYPE_VOD;
         } else if (av_strstart(line, "#EXT-X-MAP:", &ptr)) {
+            allow_repeated_ad_blocks = 0;
             struct init_section_info info = {{0}};
             ret = ensure_playlist(c, &pls, url);
             if (ret < 0)
@@ -1091,6 +1119,7 @@ static int parse_playlist(HLSContext *c, const char *url,
             }
 
         } else if (av_strstart(line, "#EXT-X-START:", &ptr)) {
+            allow_repeated_ad_blocks = 0;
             const char *time_offset_value = NULL;
             ret = ensure_playlist(c, &pls, url);
             if (ret < 0) {
@@ -1115,6 +1144,23 @@ static int parse_playlist(HLSContext *c, const char *url,
                 pls->finished = 1;
         } else if (!strcmp(line, "#EXT-X-DISCONTINUITY")) {
             discontinuity = 1;
+        } else if (!strcmp(line, "#EXT-X-CUE-OUT") ||
+                   av_strstart(line, "#EXT-X-CUE-OUT:", NULL)) {
+            if (in_cue || is_segment)
+                valid_cue = 0;
+            in_cue = 1;
+            has_cue = 1;
+        } else if (!strcmp(line, "#EXT-X-CUE-IN") ||
+                   av_strstart(line, "#EXT-X-CUE-IN:", NULL)) {
+            if (!in_cue || is_segment)
+                valid_cue = 0;
+            in_cue = 0;
+            has_cue = 1;
+        } else if (!strcmp(line, "#EXT-X-CUE-OUT-CONT") ||
+                   av_strstart(line, "#EXT-X-CUE-OUT-CONT:", NULL)) {
+            if (!in_cue || is_segment)
+                valid_cue = 0;
+            has_cue = 1;
         } else if (av_strstart(line, "#EXTINF:", &ptr)) {
             double d = atof(ptr) * AV_TIME_BASE;
             if (d < 0 || d > INT64_MAX || isnan(d)) {
@@ -1133,6 +1179,11 @@ static int parse_playlist(HLSContext *c, const char *url,
                 goto fail;
             }
         } else if (av_strstart(line, "#", NULL)) {
+            if (strcmp(line, "#EXT-X-INDEPENDENT-SEGMENTS") &&
+                !av_strstart(line, "#EXT-X-VERSION:", NULL))
+                allow_repeated_ad_blocks = 0;
+            if (av_strstart(line, "#EXT-X-SKIP:", NULL))
+                valid_cue = 0;
             av_log(c->ctx, AV_LOG_VERBOSE, "Skip ('%s')\n", line);
             continue;
         } else if (line[0]) {
@@ -1208,6 +1259,9 @@ static int parse_playlist(HLSContext *c, const char *url,
                     duration = 0.001 * AV_TIME_BASE;
                 }
                 seg->duration = duration;
+                seg->ad_removed = 0;
+                seg->discontinuity = discontinuity;
+                seg->cue_ad = in_cue;
                 seg->key_type = key_type;
                 pls->has_discontinuity |= discontinuity;
                 dynarray_add(&pls->segments, &pls->n_segments, seg);
@@ -1227,6 +1281,11 @@ static int parse_playlist(HLSContext *c, const char *url,
                 seg->init_section = cur_init_section;
             }
         }
+    }
+    if (pls) {
+        pls->has_cue = has_cue;
+        pls->valid_cue = valid_cue && !in_cue && !is_segment;
+        pls->allow_repeated_ad_blocks = allow_repeated_ad_blocks;
     }
     if (prev_segments) {
         if (pls->start_seq_no > prev_start_seq_no && c->first_timestamp != AV_NOPTS_VALUE &&
@@ -1285,10 +1344,577 @@ static struct segment *current_segment(struct playlist *pls)
 static struct segment *next_segment(struct playlist *pls)
 {
     int64_t n = pls->cur_seq_no - pls->start_seq_no + 1;
+    while (n < pls->n_segments && pls->segments[n]->ad_removed)
+        n++;
     if (n >= pls->n_segments)
         return NULL;
     return pls->segments[n];
 }
+
+static FFHLSAdSegment ad_segment(const struct segment *seg)
+{
+    FFHLSAdSegment value = {
+        .url = seg->url,
+        .key = seg->key,
+        .init_url = seg->init_section ? seg->init_section->url : NULL,
+        .duration = seg->duration,
+        .offset = seg->url_offset,
+        .size = seg->size,
+        .key_type = seg->key_type,
+        .discontinuity = seg->discontinuity,
+        .cue_ad = seg->cue_ad,
+    };
+    memcpy(value.iv, seg->iv, sizeof(seg->iv));
+    return value;
+}
+
+static int detect_ad_segments(const struct playlist *pls, uint8_t *remove)
+{
+    FFHLSAdSegment *segments = av_calloc(pls->n_segments, sizeof(*segments));
+    int count;
+
+    if (!segments)
+        return AVERROR(ENOMEM);
+    for (int i = 0; i < pls->n_segments; i++) {
+        segments[i] = ad_segment(pls->segments[i]);
+    }
+    count = ff_hls_ad_detect(segments, pls->n_segments, pls->has_cue,
+                             pls->valid_cue, pls->allow_repeated_ad_blocks,
+                             remove);
+    av_free(segments);
+    return count;
+}
+
+static int next_ad_interval(const struct playlist *pls, const uint8_t *remove,
+                            int *index, int64_t *time,
+                            int64_t *start, int64_t *end)
+{
+    while (*index < pls->n_segments && !remove[*index]) {
+        int64_t duration = pls->segments[*index]->duration;
+        if (duration <= 0 || *time > INT64_MAX - duration)
+            return -1;
+        *time += duration;
+        (*index)++;
+    }
+    if (*index == pls->n_segments)
+        return 0;
+    *start = *time;
+    while (*index < pls->n_segments && remove[*index]) {
+        int64_t duration = pls->segments[*index]->duration;
+        if (duration <= 0 || *time > INT64_MAX - duration)
+            return -1;
+        *time += duration;
+        (*index)++;
+    }
+    *end = *time;
+    return 1;
+}
+
+static int matching_ad_intervals(const struct playlist *a, const uint8_t *a_mask,
+                                 const struct playlist *b, const uint8_t *b_mask)
+{
+    int a_index = 0, b_index = 0;
+    int64_t a_time = 0, b_time = 0;
+    int64_t a_start, a_end, b_start, b_end;
+    int a_next, b_next;
+
+    for (;;) {
+        a_next = next_ad_interval(a, a_mask, &a_index, &a_time, &a_start, &a_end);
+        b_next = next_ad_interval(b, b_mask, &b_index, &b_time, &b_start, &b_end);
+        if (a_next < 0 || b_next < 0)
+            return 0;
+        if (a_next != b_next)
+            return 0;
+        if (!a_next)
+            return a_time >= b_time ? a_time - b_time <= 1000 : b_time - a_time <= 1000;
+        if ((a_start >= b_start ? a_start - b_start : b_start - a_start) > 1000 ||
+            (a_end >= b_end ? a_end - b_end : b_end - a_end) > 1000)
+            return 0;
+    }
+}
+
+static void apply_ad_detection(HLSContext *c)
+{
+    uint8_t **remove = NULL;
+    int64_t removed_duration = 0;
+
+    if (!c->hls_adblock || c->ctx->duration == AV_NOPTS_VALUE ||
+        !c->n_playlists)
+        return;
+    remove = av_calloc(c->n_playlists, sizeof(*remove));
+    if (!remove)
+        return;
+    for (int i = 0; i < c->n_playlists; i++) {
+        const struct playlist *pls = c->playlists[i];
+        if (!pls->finished || pls->time_offset_flag || !pls->n_segments)
+            goto cleanup;
+        remove[i] = av_calloc(pls->n_segments, sizeof(**remove));
+        if (!remove[i] || detect_ad_segments(pls, remove[i]) < 0)
+            goto cleanup;
+        if (i && !matching_ad_intervals(c->playlists[0], remove[0], pls, remove[i]))
+            goto cleanup;
+    }
+    for (int i = 0; i < c->playlists[0]->n_segments; i++) {
+        if (remove[0][i]) {
+            int64_t duration = c->playlists[0]->segments[i]->duration;
+            if (duration <= 0 || removed_duration > INT64_MAX - duration)
+                goto cleanup;
+            removed_duration += duration;
+        }
+    }
+    if (!removed_duration || removed_duration >= c->ctx->duration)
+        goto cleanup;
+    for (int p = 0; p < c->n_playlists; p++) {
+        struct playlist *pls = c->playlists[p];
+        for (int i = 0; i < pls->n_segments; i++)
+            pls->segments[i]->ad_removed = remove[p][i];
+        pls->has_discontinuity = 1;
+    }
+    c->ctx->duration -= removed_duration;
+    av_log(c->ctx, AV_LOG_INFO, "Removed verified HLS ad segments\n");
+
+cleanup:
+    for (int i = 0; i < c->n_playlists; i++)
+        av_free(remove[i]);
+    av_free(remove);
+}
+
+#if HAVE_PTHREADS
+static int ad_probe_interrupted(void *opaque)
+{
+    HLSContext *c = opaque;
+    int canceled;
+
+    ff_mutex_lock(&c->ad_probe_mutex);
+    canceled = c->ad_probe_cancel;
+    ff_mutex_unlock(&c->ad_probe_mutex);
+    return canceled || ff_check_interrupt(c->interrupt_callback);
+}
+
+typedef struct AdProbeCandidate {
+    int first;
+    int end;
+} AdProbeCandidate;
+
+static int ad_probe_compare_candidates(const void *first, const void *second)
+{
+    const AdProbeCandidate *a = first, *b = second;
+    int a_length = a->end - a->first;
+    int b_length = b->end - b->first;
+
+    if (a_length != b_length)
+        return (a_length > b_length) - (a_length < b_length);
+    return (a->first > b->first) - (a->first < b->first);
+}
+
+#define AD_PROBE_PARALLELISM 4
+#define AD_PROBE_MAX_PROBES 96
+#define AD_PROBE_MAX_TOTAL_BYTES (96 * 1024 * 1024)
+
+enum AdProbeMeasurement {
+    AD_PROBE_UNMEASURED,
+    AD_PROBE_VALID,
+    /* Repeated candidates must not reopen a failed or unsupported segment. */
+    AD_PROBE_UNAVAILABLE,
+};
+
+typedef struct AdProbeTask {
+    HLSContext *c;
+    const struct segment *segment;
+    const AVIOInterruptCB *interrupt;
+    FFHLSAdProbeResult *result;
+    pthread_t thread;
+    int index;
+    int ret;
+    int threaded;
+} AdProbeTask;
+
+static void *ad_probe_run_task(void *opaque)
+{
+    AdProbeTask *task = opaque;
+
+    task->ret = ff_hls_ad_probe(task->segment->url, task->c->ad_probe_avio_opts,
+                                task->interrupt, task->c->ctx->protocol_whitelist,
+                                task->c->ctx->protocol_blacklist,
+                                av_gettime_relative() + 10 * AV_TIME_BASE,
+                                task->result);
+    return NULL;
+}
+
+static int ad_probe_measure_batch(HLSContext *c, const struct playlist *pls,
+                                   FFHLSAdProbeResult *results,
+                                   uint8_t *measurements,
+                                   const AVIOInterruptCB *interrupt,
+                                   const int *indices, int count,
+                                   int *probes, int64_t *bytes)
+{
+    int next = 0;
+    int valid = 1;
+
+    av_assert0(count > 0 && count <= AD_PROBE_PARALLELISM);
+    while (next < count) {
+        AdProbeTask tasks[AD_PROBE_PARALLELISM] = {0};
+        int scheduled = 0;
+
+        while (next < count) {
+            int index = indices[next];
+            const struct segment *seg = pls->segments[index];
+
+            if (measurements[index] != AD_PROBE_UNMEASURED) {
+                valid &= measurements[index] == AD_PROBE_VALID;
+                next++;
+                continue;
+            }
+            if (seg->key_type != KEY_NONE || seg->size >= 0 || seg->init_section ||
+                *probes + scheduled >= AD_PROBE_MAX_PROBES ||
+                *bytes >= AD_PROBE_MAX_TOTAL_BYTES) {
+                measurements[index] = AD_PROBE_UNAVAILABLE;
+                valid = 0;
+                next++;
+                continue;
+            }
+            if (scheduled > 0 && *bytes + (int64_t)(scheduled + 1) *
+                                  HLS_AD_PROBE_MAX_SEGMENT_BYTES >
+                                  AD_PROBE_MAX_TOTAL_BYTES)
+                break;
+            measurements[index] = AD_PROBE_UNAVAILABLE;
+            tasks[scheduled++] = (AdProbeTask) {
+                .c = c,
+                .segment = seg,
+                .interrupt = interrupt,
+                .result = &results[index],
+                .index = index,
+            };
+            next++;
+        }
+        *probes += scheduled;
+        for (int i = 0; i < scheduled; i++) {
+            if (scheduled > 1 && !pthread_create(&tasks[i].thread, NULL,
+                                                 ad_probe_run_task, &tasks[i]))
+                tasks[i].threaded = 1;
+            else
+                ad_probe_run_task(&tasks[i]);
+        }
+        for (int i = 0; i < scheduled; i++) {
+            if (tasks[i].threaded)
+                pthread_join(tasks[i].thread, NULL);
+            if (tasks[i].ret < 0) {
+                av_log(c->ctx, AV_LOG_DEBUG,
+                       "HLS ad probe segment %d failed: %s\n",
+                       tasks[i].index, av_err2str(tasks[i].ret));
+                valid = 0;
+            } else {
+                *bytes += tasks[i].result->size;
+                measurements[tasks[i].index] = AD_PROBE_VALID;
+            }
+        }
+    }
+    return valid;
+}
+
+static int ad_probe_measure(HLSContext *c, const struct playlist *pls,
+                            FFHLSAdProbeResult *results, uint8_t *measurements,
+                            const AVIOInterruptCB *interrupt, int index,
+                            int *probes, int64_t *bytes)
+{
+    return ad_probe_measure_batch(c, pls, results, measurements, interrupt,
+                                   &index, 1, probes, bytes);
+}
+
+static int ad_probe_same_durations(const struct playlist *pls,
+                                   AdProbeCandidate first,
+                                   AdProbeCandidate second)
+{
+    if (first.end - first.first != second.end - second.first)
+        return 0;
+    for (int i = 0; i < first.end - first.first; i++)
+        if (pls->segments[first.first + i]->duration !=
+            pls->segments[second.first + i]->duration)
+            return 0;
+    return 1;
+}
+
+static int ad_probe_separated(const uint8_t *covered, int count,
+                              int first, int end)
+{
+    for (int i = FFMAX(0, first - 1); i <= FFMIN(count - 1, end); i++)
+        if (covered[i])
+            return 0;
+    return 1;
+}
+
+static void ad_probe_publish(HLSContext *c, uint8_t *covered,
+                             int first, int end, int repeated)
+{
+    int published = 0;
+
+    ff_mutex_lock(&c->ad_probe_mutex);
+    if (!c->ad_probe_cancel && first >= c->ad_probe_frontier) {
+        memset(c->ad_probe_confirmed + first, 1, end - first);
+        published = 1;
+    }
+    ff_mutex_unlock(&c->ad_probe_mutex);
+    if (published) {
+        memset(covered + first, 1, end - first);
+        av_log(c->ctx, AV_LOG_DEBUG, "Confirmed %sHLS ad candidate [%d, %d)\n",
+               repeated ? "repeated " : "", first, end);
+    }
+}
+
+static void *ad_probe_worker(void *opaque)
+{
+    HLSContext *c = opaque;
+    const struct playlist *pls = c->playlists[0];
+    FFHLSAdSegment *segments = av_calloc(pls->n_segments, sizeof(*segments));
+    FFHLSAdProbeResult *results = av_calloc(pls->n_segments, sizeof(*results));
+    uint8_t *measurements = av_calloc(pls->n_segments, sizeof(*measurements));
+    uint8_t *covered = av_calloc(pls->n_segments, sizeof(*covered));
+    AdProbeCandidate *candidates = av_calloc(pls->n_segments, sizeof(*candidates));
+    AVIOInterruptCB interrupt = {ad_probe_interrupted, c};
+    int probes = 0, count = 0, block_start = 0;
+    int64_t bytes = 0;
+
+    if (!segments || !results || !measurements || !covered || !candidates)
+        goto cleanup;
+    for (int i = 0; i < pls->n_segments; i++)
+        segments[i] = ad_segment(pls->segments[i]);
+    for (int end = 1; end <= pls->n_segments; end++) {
+        if (end < pls->n_segments && !segments[end].discontinuity)
+            continue;
+        if (block_start > 0 && end < pls->n_segments &&
+            end - block_start <= 30)
+            candidates[count++] = (AdProbeCandidate){block_start, end};
+        block_start = end;
+    }
+    /* Short windows are checked first, as in Media3; the frontier rejects late removals. */
+    qsort(candidates, count, sizeof(*candidates), ad_probe_compare_candidates);
+    for (int candidate = 0; candidate < count; candidate++) {
+        int first = candidates[candidate].first;
+        int end = candidates[candidate].end;
+        int failed = 0, canceled, too_late;
+
+        if (!ad_probe_separated(covered, pls->n_segments, first, end))
+            continue;
+        ff_mutex_lock(&c->ad_probe_mutex);
+        canceled = c->ad_probe_cancel;
+        too_late = first < c->ad_probe_frontier;
+        ff_mutex_unlock(&c->ad_probe_mutex);
+        if (canceled)
+            break;
+        if (too_late)
+            continue;
+        for (int candidate_end = end, attempt = 0;
+             candidate_end < pls->n_segments && candidate_end - first <= 30 &&
+             attempt < 3; attempt++) {
+            int boundaries[] = {first - 1, first, candidate_end};
+
+            if (!ad_probe_separated(covered, pls->n_segments,
+                                    first, candidate_end))
+                break;
+            /* Measure entry and exit in parallel to avoid another network round trip. */
+            if (!ad_probe_measure_batch(c, pls, results, measurements,
+                                        &interrupt, boundaries, 3,
+                                        &probes, &bytes) ||
+                !ff_hls_ad_candidate_start(segments, results,
+                                           pls->n_segments, first)) {
+                failed = 1;
+                break;
+            }
+            if (ff_hls_ad_candidate_boundaries(segments, results,
+                                               pls->n_segments, first,
+                                               candidate_end)) {
+                for (int i = first + 1; i < candidate_end;) {
+                    int indices[AD_PROBE_PARALLELISM], n = 0;
+
+                    while (i < candidate_end && n < AD_PROBE_PARALLELISM)
+                        indices[n++] = i++;
+                    if (!ad_probe_measure_batch(c, pls, results, measurements,
+                                                &interrupt, indices, n,
+                                                &probes, &bytes)) {
+                        failed = 1;
+                        break;
+                    }
+                }
+                if (failed)
+                    break;
+            }
+            if (ff_hls_ad_confirm_window(segments, results,
+                                         pls->n_segments, first, candidate_end)) {
+                ad_probe_publish(c, covered, first, candidate_end, 0);
+                break;
+            }
+            while (++candidate_end < pls->n_segments &&
+                   !segments[candidate_end].discontinuity) {}
+        }
+        if (covered[first])
+            continue;
+        ff_mutex_lock(&c->ad_probe_mutex);
+        canceled = c->ad_probe_cancel;
+        too_late = first < c->ad_probe_frontier;
+        ff_mutex_unlock(&c->ad_probe_mutex);
+        if (canceled)
+            break;
+        if (too_late || end - first < 2 ||
+            measurements[first] != AD_PROBE_VALID ||
+            !ad_probe_separated(covered, pls->n_segments, first, end))
+            continue;
+        /* Try an exact replay now, while this candidate is still ahead of playback. */
+        for (int other = 0; other < count; other++) {
+            int other_first = candidates[other].first;
+            int other_end = candidates[other].end;
+            int matches = 1;
+
+            if (other == candidate ||
+                !ad_probe_same_durations(pls, candidates[candidate],
+                                          candidates[other]) ||
+                !ad_probe_measure(c, pls, results, measurements, &interrupt,
+                                  other_first, &probes, &bytes) ||
+                memcmp(results[first].content_fingerprint,
+                       results[other_first].content_fingerprint,
+                       sizeof(results[first].content_fingerprint)))
+                continue;
+            for (int i = 1; i < end - first;) {
+                int indices[AD_PROBE_PARALLELISM], start = i, n = 0;
+
+                while (i < end - first && n + 2 <= AD_PROBE_PARALLELISM) {
+                    indices[n++] = first + i;
+                    indices[n++] = other_first + i++;
+                }
+                if (!ad_probe_measure_batch(c, pls, results, measurements,
+                                            &interrupt, indices, n,
+                                            &probes, &bytes)) {
+                    matches = 0;
+                    break;
+                }
+                for (int offset = start; offset < i; offset++)
+                    if (memcmp(results[first + offset].content_fingerprint,
+                               results[other_first + offset].content_fingerprint,
+                               sizeof(results[first + offset].content_fingerprint))) {
+                        matches = 0;
+                        break;
+                    }
+                if (!matches)
+                    break;
+            }
+            if (!matches || !ff_hls_ad_same_content(segments, results,
+                                                    pls->n_segments, first,
+                                                    end, other_first, other_end))
+                continue;
+            ad_probe_publish(c, covered, first, end, 1);
+            break;
+        }
+    }
+
+cleanup:
+    av_free(candidates);
+    av_free(covered);
+    av_free(measurements);
+    av_free(results);
+    av_free(segments);
+    return NULL;
+}
+
+static void start_ad_probe(HLSContext *c)
+{
+    struct playlist *pls;
+
+    if (!c->hls_adblock || c->n_playlists != 1)
+        return;
+    pls = c->playlists[0];
+    if (!pls->finished || pls->time_offset_flag || pls->has_cue ||
+        !pls->allow_repeated_ad_blocks || pls->n_segments < 3)
+        return;
+    for (int i = 0; i < pls->n_segments; i++)
+        if (pls->segments[i]->ad_removed)
+            return;
+    c->ad_probe_confirmed = av_calloc(pls->n_segments, sizeof(*c->ad_probe_confirmed));
+    if (!c->ad_probe_confirmed)
+        return;
+    if (av_dict_copy(&c->ad_probe_avio_opts, c->avio_opts, 0) < 0)
+        goto fail;
+    if (c->ca_file &&
+        av_dict_set(&c->ad_probe_avio_opts, "ca_file", c->ca_file, 0) < 0)
+        goto fail;
+    if (av_dict_set_int(&c->ad_probe_avio_opts, "tls_verify",
+                        c->tls_verify, 0) < 0)
+        goto fail;
+    c->ad_probe_frontier = FFMAX(0, pls->cur_seq_no - pls->start_seq_no + 1);
+    if (ff_mutex_init(&c->ad_probe_mutex, NULL))
+        goto fail;
+    if (pthread_create(&c->ad_probe_thread, NULL, ad_probe_worker, c)) {
+        ff_mutex_destroy(&c->ad_probe_mutex);
+        goto fail;
+    }
+    c->ad_probe_started = 1;
+    return;
+
+fail:
+    av_dict_free(&c->ad_probe_avio_opts);
+    av_freep(&c->ad_probe_confirmed);
+}
+
+static void apply_probed_ads(HLSContext *c)
+{
+    struct playlist *pls;
+    int64_t removed_duration = 0;
+    int close_prefetch = 0;
+    int frontier;
+
+    if (!c->ad_probe_started || c->first_timestamp == AV_NOPTS_VALUE)
+        return;
+    pls = c->playlists[0];
+    frontier = FFMAX(0, pls->cur_seq_no - pls->start_seq_no + 1);
+    ff_mutex_lock(&c->ad_probe_mutex);
+    /* Never expose already selected segments after a backward seek. */
+    c->ad_probe_frontier = FFMAX(c->ad_probe_frontier, frontier);
+    frontier = c->ad_probe_frontier;
+    for (int i = 0; i < pls->n_segments;) {
+        int first, end;
+
+        if (!c->ad_probe_confirmed[i]) {
+            i++;
+            continue;
+        }
+        first = i;
+        while (i < pls->n_segments && c->ad_probe_confirmed[i])
+            i++;
+        end = i;
+        memset(c->ad_probe_confirmed + first, 0, end - first);
+        if (first < frontier)
+            continue;
+        for (int j = first; j < end; j++) {
+            pls->segments[j]->ad_removed = 1;
+            removed_duration += pls->segments[j]->duration;
+        }
+        if (pls->input_next_requested && first == frontier)
+            close_prefetch = 1;
+    }
+    ff_mutex_unlock(&c->ad_probe_mutex);
+    if (!removed_duration)
+        return;
+    if (close_prefetch) {
+        ff_format_io_close(pls->parent, &pls->input_next);
+        pls->input_next_requested = 0;
+    }
+    pls->has_discontinuity = 1;
+    c->ctx->duration -= removed_duration;
+    av_log(c->ctx, AV_LOG_INFO, "Removed probed HLS ad segments\n");
+}
+
+static void stop_ad_probe(HLSContext *c)
+{
+    if (!c->ad_probe_started)
+        return;
+    ff_mutex_lock(&c->ad_probe_mutex);
+    c->ad_probe_cancel = 1;
+    ff_mutex_unlock(&c->ad_probe_mutex);
+    pthread_join(c->ad_probe_thread, NULL);
+    ff_mutex_destroy(&c->ad_probe_mutex);
+    av_dict_free(&c->ad_probe_avio_opts);
+    av_freep(&c->ad_probe_confirmed);
+    c->ad_probe_started = 0;
+}
+#endif
 
 /* True if 'next' can be reached by seeking the open 'in' instead of reopening.
  * An unencrypted, contiguous byte range directly following 'cur' in the same
@@ -1590,7 +2216,8 @@ static int open_input(HLSContext *c, struct playlist *pls, struct segment *seg, 
             int64_t n = pls->cur_seq_no - pls->start_seq_no + 1;
             while (n < pls->n_segments) {
                 struct segment *ns = pls->segments[n];
-                if (ns->size < 0 || ns->url_offset != end_offset ||
+                if (ns->ad_removed || ns->size < 0 ||
+                    ns->url_offset != end_offset ||
                     ns->key_type != KEY_NONE ||
                     ns->init_section != seg->init_section ||
                     strcmp(ns->url, seg->url))
@@ -1775,6 +2402,9 @@ static int reload_playlist(struct playlist *v, HLSContext *c)
     int ret = 0;
     int reload_count = 0;
 
+#if HAVE_PTHREADS
+    apply_probed_ads(c);
+#endif
     v->needed = playlist_needed(v);
 
     if (!v->needed)
@@ -1819,6 +2449,24 @@ reload:
                    "skipping %"PRId64" segments ahead, expired from playlists\n",
                    v->start_seq_no - v->cur_seq_no);
             v->cur_seq_no = v->start_seq_no;
+        }
+
+        if (v->finished) {
+            int64_t index = v->cur_seq_no - v->start_seq_no;
+            int skipped = 0;
+            while (index >= 0 && index < v->n_segments &&
+                   v->segments[index]->ad_removed) {
+                v->cur_seq_no++;
+                index++;
+                skipped = 1;
+            }
+            if (skipped && index < v->n_segments) {
+                int64_t start = c->first_timestamp;
+                for (int i = 0; i < index; i++)
+                    if (!v->segments[i]->ad_removed)
+                        start = av_sat_add64(start, v->segments[i]->duration);
+                reset_playlist_timestamps(v, start);
+            }
         }
         if (v->cur_seq_no > v->last_seq_no) {
             v->last_seq_no = v->cur_seq_no;
@@ -1950,7 +2598,10 @@ restart:
 
         return ret;
     }
-    if (ret == 0 && segment_reusable(v->input, seg, next_segment(v))) {
+    int64_t next_index = v->cur_seq_no - v->start_seq_no + 1;
+    if (ret == 0 && next_index < v->n_segments &&
+        !v->segments[next_index]->ad_removed &&
+        segment_reusable(v->input, seg, next_segment(v))) {
         /* Clean boundary, and the next segment continues this resource. Keep
          * the connection open and read it as a whole. Note that splitting
          * segments in these cases is useful for dynamic variant/quality
@@ -2148,7 +2799,8 @@ static int find_timestamp_in_playlist(HLSContext *c, struct playlist *pls,
     }
 
     for (i = 0; i < pls->n_segments; i++) {
-        int64_t diff = pos + pls->segments[i]->duration - timestamp;
+        int64_t duration = pls->segments[i]->ad_removed ? 0 : pls->segments[i]->duration;
+        int64_t diff = pos + duration - timestamp;
         if (diff > 0) {
             *seq_no = pls->start_seq_no + i;
             if (seg_start_ts) {
@@ -2156,7 +2808,7 @@ static int find_timestamp_in_playlist(HLSContext *c, struct playlist *pls,
             }
             return 1;
         }
-        pos += pls->segments[i]->duration;
+        pos += duration;
     }
 
     *seq_no = pls->start_seq_no + pls->n_segments - 1;
@@ -2349,6 +3001,9 @@ static int hls_close(AVFormatContext *s)
 {
     HLSContext *c = s->priv_data;
 
+#if HAVE_PTHREADS
+    stop_ad_probe(c);
+#endif
     free_playlist_list(c);
     free_variant_list(c);
     free_rendition_list(c);
@@ -2452,6 +3107,8 @@ static int hls_read_header(AVFormatContext *s)
             add_renditions_to_variant(c, var, AVMEDIA_TYPE_SUBTITLE, var->subtitles_group);
     }
 
+    apply_ad_detection(c);
+
     /* Create a program for each variant */
     for (i = 0; i < c->n_variants; i++) {
         struct variant *v = c->variants[i];
@@ -2471,6 +3128,9 @@ static int hls_read_header(AVFormatContext *s)
             continue;
 
         pls->cur_seq_no = select_cur_seq_no(c, pls);
+        while (pls->cur_seq_no - pls->start_seq_no < pls->n_segments &&
+               pls->segments[pls->cur_seq_no - pls->start_seq_no]->ad_removed)
+            pls->cur_seq_no++;
         highest_cur_seq_no = FFMAX(highest_cur_seq_no, pls->cur_seq_no);
     }
 
@@ -2483,6 +3143,7 @@ static int hls_read_header(AVFormatContext *s)
         char *url;
         AVDictionary *options = NULL;
         struct segment *seg = NULL;
+        const char *initial_url;
 
         if (!(pls->ctx = avformat_alloc_context()))
             return AVERROR(ENOMEM);
@@ -2505,6 +3166,10 @@ static int hls_read_header(AVFormatContext *s)
             highest_cur_seq_no < pls->start_seq_no + pls->n_segments) {
             pls->cur_seq_no = highest_cur_seq_no;
         }
+        seg = current_segment(pls);
+        if (!seg)
+            return AVERROR_EOF;
+        initial_url = seg->url;
 
         pls->read_buffer = av_malloc(INITIAL_BUFFER_SIZE);
         if (!pls->read_buffer){
@@ -2572,7 +3237,7 @@ static int hls_read_header(AVFormatContext *s)
             pls->ctx->probesize = s->probesize > 0 ? s->probesize : 1024 * 4;
             pls->ctx->max_analyze_duration = s->max_analyze_duration > 0 ? s->max_analyze_duration : 4 * AV_TIME_BASE;
             pls->ctx->interrupt_callback = s->interrupt_callback;
-            url = av_strdup(pls->segments[0]->url);
+            url = av_strdup(initial_url);
             ret = av_probe_input_buffer(&pls->pb.pub, &in_fmt, url, NULL, 0, 0);
             if (ret >= 0 && in_fmt &&
                 probe_image_wrapped_mpegts(&pls->pb.pub, in_fmt->name)) {
@@ -2628,7 +3293,7 @@ static int hls_read_header(AVFormatContext *s)
 
         av_dict_copy(&options, c->seg_format_opts, 0);
 
-        ret = avformat_open_input(&pls->ctx, pls->segments[0]->url, in_fmt, &options);
+        ret = avformat_open_input(&pls->ctx, initial_url, in_fmt, &options);
         av_dict_free(&options);
         if (ret < 0)
             return ret;
@@ -2689,6 +3354,9 @@ static int hls_read_header(AVFormatContext *s)
 
     update_noheader_flag(s);
 
+#if HAVE_PTHREADS
+    start_ad_probe(c);
+#endif
     return 0;
 }
 
@@ -3286,10 +3954,16 @@ static const AVOption hls_options[] = {
         OFFSET(http_multiple), AV_OPT_TYPE_BOOL, {.i64 = -1}, -1, 1, FLAGS},
     {"http_seekable", "Use HTTP partial requests, 0 = disable, 1 = enable, -1 = auto",
         OFFSET(http_seekable), AV_OPT_TYPE_BOOL, { .i64 = -1}, -1, 1, FLAGS},
+    {"ca_file", "Certificate Authority database file for HLS ad probes",
+        OFFSET(ca_file), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, FLAGS},
+    {"tls_verify", "Verify certificates for HLS ad probes",
+        OFFSET(tls_verify), AV_OPT_TYPE_BOOL, {.i64 = 1}, 0, 1, FLAGS},
     {"seg_format_options", "Set options for segment demuxer",
         OFFSET(seg_format_opts), AV_OPT_TYPE_DICT, {.str = NULL}, 0, 0, FLAGS},
     {"seg_max_retry", "Maximum number of times to reload a segment on error.",
      OFFSET(seg_max_retry), AV_OPT_TYPE_INT, {.i64 = 0}, 0, INT_MAX, FLAGS},
+    {"hls_adblock", "Remove verified VOD HLS ad breaks",
+     OFFSET(hls_adblock), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, FLAGS},
     {NULL}
 };
 
