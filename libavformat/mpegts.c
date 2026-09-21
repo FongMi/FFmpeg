@@ -852,6 +852,7 @@ static const StreamType ISO_types[] = {
     { STREAM_TYPE_VIDEO_AVS2,     AVMEDIA_TYPE_VIDEO, AV_CODEC_ID_AVS2       },
     { STREAM_TYPE_VIDEO_AVS3,     AVMEDIA_TYPE_VIDEO, AV_CODEC_ID_AVS3       },
     { STREAM_TYPE_VIDEO_VC1,      AVMEDIA_TYPE_VIDEO, AV_CODEC_ID_VC1        },
+    { STREAM_TYPE_AUDIO_AV3A,     AVMEDIA_TYPE_AUDIO, AV_CODEC_ID_AV3A       },
     { 0 },
 };
 
@@ -1085,7 +1086,7 @@ static int new_pes_packet(PESContext *pes, AVPacket *pkt)
     }
 
     // JPEG-XS PES payload
-    if (pes->stream_id == 0xbd && pes->stream_type == 0x32 &&
+    if (pes->stream_id == 0xbd && pes->stream_type == STREAM_TYPE_VIDEO_JPEGXS &&
         pkt->size >= 8 && memcmp(pkt->data + 4, "jxes", 4) == 0)
     {
         uint32_t header_size = AV_RB32(pkt->data);
