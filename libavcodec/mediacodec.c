@@ -118,7 +118,7 @@ int av_mediacodec_release_buffer_status(AVMediaCodecBuffer *buffer, int render)
     int result = 0;
 
     if (claim_output_buffer(buffer)) {
-        av_log(ctx->avctx, AV_LOG_DEBUG,
+        av_log(ctx, AV_LOG_DEBUG,
                "Releasing output buffer %zd (%p) ts=%"PRId64" with render=%d [%d pending]\n",
                buffer->index, buffer, buffer->pts, render, atomic_load(&ctx->hw_buffer_count));
         int ret = ff_AMediaCodec_releaseOutputBuffer(ctx->codec, buffer->index, render);
@@ -145,7 +145,7 @@ int av_mediacodec_render_buffer_at_time(AVMediaCodecBuffer *buffer, int64_t time
     int result = AVERROR(ENOENT);
 
     if (claim_output_buffer(buffer)) {
-        av_log(ctx->avctx, AV_LOG_DEBUG,
+        av_log(ctx, AV_LOG_DEBUG,
                "Rendering output buffer %zd (%p) ts=%"PRId64" with time=%"PRId64" [%d pending]\n",
                buffer->index, buffer, buffer->pts, time, atomic_load(&ctx->hw_buffer_count));
         result = ff_AMediaCodec_releaseOutputBufferAtTime(ctx->codec, buffer->index, time);

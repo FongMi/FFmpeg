@@ -1167,6 +1167,8 @@ enum AVStreamGroupParamsType {
     AV_STREAM_GROUP_PARAMS_GAIN_MAP,
 };
 
+#define AV_HAVE_DOLBY_VISION_STREAM_GROUP 1
+
 struct AVIAMFAudioElement;
 struct AVIAMFMixPresentation;
 
