@@ -108,6 +108,12 @@ API changes, most recent first:
   descriptors as bare metadata tag names is now opt-in through this flag,
   only the <tag>-<description>-<lang> tag is exported by default.
 
+2026-08-09 - xxxxxxxxxx - lavc local API, no version bump - mediacodec.h
+  Add av_mediacodec_release_buffer_status().
+
+2026-08-09 - xxxxxxxxxx - lavc local API, no version bump - mediacodec.h
+  Add av_mediacodec_get_buffer_timestamp().
+
 2026-07-04 - 047eb184511 - lavc 63.7.100 - codec_id.h
   Add AV_CODEC_ID_PCM_DVDA.
 
