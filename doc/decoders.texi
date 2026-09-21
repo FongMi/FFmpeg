@@ -307,6 +307,25 @@ This decoder generates wave patterns according to predefined sequences. Its
 use is purely internal and the format of the data it accepts is not publicly
 documented.
 
+@section libarcdav3a
+
+AVS3 audio decoder wrapper. Mixed sound-bed and object signals are rendered to
+the stereo, 5.1 or 7.1.4 sound-bed layout before publishing PCM. Other mixed
+speaker layouts and advanced object rendering features are not implemented.
+
+Requires libarcdav3a built with speaker-renderer support and FFmpeg configured
+with @code{--enable-libarcdav3a --enable-version3}.
+
+@subsection Options
+
+@table @option
+@item content_index
+Select a zero-based content reference within the audio programme, from 0 to 3.
+The default is 0. Only objects belonging to the selected presentation are
+rendered; alternative presentations are not mixed together. This option does
+not infer a language from container metadata.
+@end table
+
 @section libgsm
 
 libgsm decoder wrapper.
