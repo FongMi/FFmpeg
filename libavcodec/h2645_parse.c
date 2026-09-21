@@ -533,6 +533,10 @@ int ff_h2645_packet_split(H2645Packet *pkt, const uint8_t *buf, int length,
     int next_avc = (flags & H2645_FLAG_IS_NALFF) ? 0 : length;
     int64_t padding = (flags & H2645_FLAG_SMALL_PADDING) ? 0 : MAX_MBPAIR_SIZE;
 
+    if ((flags & H2645_FLAG_HEVC_METADATA_ONLY) &&
+        codec_id != AV_CODEC_ID_HEVC)
+        return AVERROR(EINVAL);
+
     bytestream2_init(&bc, buf, length);
     alloc_rbsp_buffer(&pkt->rbsp, length + padding, !!(flags & H2645_FLAG_USE_REF));
 
@@ -583,6 +587,28 @@ int ff_h2645_packet_split(H2645Packet *pkt, const uint8_t *buf, int length,
             if (bytestream2_tell(&bc) >= next_avc) {
                 /* skip to the start of the next NAL */
                 bytestream2_skip(&bc, next_avc - bytestream2_tell(&bc));
+                continue;
+            }
+        }
+
+        if (flags & H2645_FLAG_HEVC_METADATA_ONLY) {
+            int nal_type;
+
+            if (extract_length < 2)
+                return AVERROR_INVALIDDATA;
+
+            nal_type = (bc.buffer[0] >> 1) & 0x3f;
+            if (nal_type != HEVC_NAL_VPS        &&
+                nal_type != HEVC_NAL_SPS        &&
+                nal_type != HEVC_NAL_PPS        &&
+                nal_type != HEVC_NAL_SEI_PREFIX &&
+                nal_type != HEVC_NAL_SEI_SUFFIX &&
+                nal_type != HEVC_NAL_UNSPEC62) {
+                int skip = extract_length;
+
+                if (!(flags & H2645_FLAG_IS_NALFF))
+                    skip = find_next_start_code(bc.buffer, buf + next_avc) - 3;
+                bytestream2_skip(&bc, FFMAX(skip, 1));
                 continue;
             }
         }
