@@ -271,6 +271,8 @@ static void ff_mediacodec_dec_unref(MediaCodecDecContext *s)
         }
 
         av_freep(&s->codec_name);
+        if (s->output_mutex_initialized)
+            ff_mutex_destroy(&s->output_mutex);
         av_freep(&s);
     }
 }
@@ -279,15 +281,7 @@ static void mediacodec_buffer_release(void *opaque, uint8_t *data)
 {
     AVMediaCodecBuffer *buffer = opaque;
     MediaCodecDecContext *ctx = buffer->ctx;
-    int released = atomic_load(&buffer->released);
-
-    if (!released && (ctx->delay_flush || buffer->serial == atomic_load(&ctx->serial))) {
-        atomic_fetch_sub(&ctx->hw_buffer_count, 1);
-        av_log(ctx->avctx, AV_LOG_DEBUG,
-               "Releasing output buffer %zd (%p) ts=%"PRId64" on free() [%d pending]\n",
-               buffer->index, buffer, buffer->pts, atomic_load(&ctx->hw_buffer_count));
-        ff_AMediaCodec_releaseOutputBuffer(ctx->codec, buffer->index, 0);
-    }
+    av_mediacodec_release_buffer(buffer, 0);
 
     ff_mediacodec_dec_unref(ctx);
     av_freep(&buffer);
@@ -722,16 +716,20 @@ static int mediacodec_dec_flush_codec(AVCodecContext *avctx, MediaCodecDecContex
     FFAMediaCodec *codec = s->codec;
     int status;
 
+    // Output buffers are held by the VO on another thread. Keep the serial
+    // change and platform flush atomic with their validation/release calls.
+    ff_mutex_lock(&s->output_mutex);
     s->output_buffer_count = 0;
 
     s->draining = 0;
     s->flushing = 0;
     s->eos = 0;
     atomic_fetch_add(&s->serial, 1);
-    atomic_init(&s->hw_buffer_count, 0);
+    atomic_store(&s->hw_buffer_count, 0);
     s->current_input_buffer = -1;
 
     status = ff_AMediaCodec_flush(codec);
+    ff_mutex_unlock(&s->output_mutex);
     if (status < 0) {
         av_log(avctx, AV_LOG_ERROR, "Failed to flush codec\n");
         return AVERROR_EXTERNAL;
@@ -841,6 +839,12 @@ int ff_mediacodec_dec_init(AVCodecContext *avctx, MediaCodecDecContext *s,
     atomic_init(&s->hw_buffer_count, 0);
     atomic_init(&s->serial, 1);
     s->current_input_buffer = -1;
+    ret = ff_mutex_init(&s->output_mutex, NULL);
+    if (ret) {
+        ret = AVERROR(ret);
+        goto fail;
+    }
+    s->output_mutex_initialized = true;
 
     if (avctx->codec_type == AVMEDIA_TYPE_AUDIO)
         ret = mediacodec_dec_get_audio_codec(avctx, s, mime, format);
@@ -1016,6 +1020,7 @@ int ff_mediacodec_dec_receive(AVCodecContext *avctx, MediaCodecDecContext *s,
         output_dequeue_timeout_us = 0;
     }
 
+retry:
     index = ff_AMediaCodec_dequeueOutputBuffer(codec, &info, output_dequeue_timeout_us);
     if (index >= 0) {
         av_log(avctx, AV_LOG_TRACE, "Got output buffer %zd"
@@ -1089,6 +1094,7 @@ int ff_mediacodec_dec_receive(AVCodecContext *avctx, MediaCodecDecContext *s,
             av_log(avctx, AV_LOG_ERROR, "Failed to dequeue output buffer within %" PRIi64 "ms "
                                         "while draining remaining frames, output will probably lack frames\n",
                                         output_dequeue_timeout_us / 1000);
+            return AVERROR_EXTERNAL;
         } else {
             av_log(avctx, AV_LOG_TRACE, "No output buffer available, try again later\n");
         }
@@ -1099,6 +1105,11 @@ int ff_mediacodec_dec_receive(AVCodecContext *avctx, MediaCodecDecContext *s,
 
     if (s->draining && s->eos)
         return AVERROR_EOF;
+    /* Format/buffer changes and empty non-EOS buffers are not requests for
+     * more input. Once draining, receive must return a frame, EOF or an error,
+     * never EAGAIN: the caller has already sent its last input packet. */
+    if (s->draining)
+        goto retry;
     return AVERROR(EAGAIN);
 }
 
@@ -1137,6 +1148,8 @@ int ff_mediacodec_dec_close(AVCodecContext *avctx, MediaCodecDecContext *s)
     if (!s)
         return 0;
 
+    if (s->output_mutex_initialized)
+        ff_mutex_lock(&s->output_mutex);
     if (s->codec) {
         if (atomic_load(&s->hw_buffer_count) == 0) {
             ff_AMediaCodec_stop(s->codec);
@@ -1146,6 +1159,8 @@ int ff_mediacodec_dec_close(AVCodecContext *avctx, MediaCodecDecContext *s)
         }
     }
 
+    if (s->output_mutex_initialized)
+        ff_mutex_unlock(&s->output_mutex);
     ff_mediacodec_dec_unref(s);
 
     return 0;
