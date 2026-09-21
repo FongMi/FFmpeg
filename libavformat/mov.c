@@ -9752,6 +9752,7 @@ static const MOVParseTableEntry mov_default_parse_table[] = {
 { MKTAG('A','R','E','S'), mov_read_ares },
 { MKTAG('a','v','s','s'), mov_read_avss },
 { MKTAG('a','v','1','C'), mov_read_glbl },
+{ MKTAG('a','v','3','c'), mov_read_glbl },
 { MKTAG('c','h','p','l'), mov_read_chpl },
 { MKTAG('c','o','6','4'), mov_read_stco },
 { MKTAG('c','o','l','r'), mov_read_colr },
