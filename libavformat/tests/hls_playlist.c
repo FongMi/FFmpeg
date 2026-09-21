@@ -52,7 +52,7 @@ static int check_playlist(const char *line, int position,
     if (parse_playlist(&hls, "http://test.invalid/index.m3u8", NULL, &io.pub) < 0)
         goto end;
     if (hls.n_playlists != 1 || !hls.playlists[0]->finished ||
-        hls.playlists[0]->n_segments != 3 ||
+        hls.playlists[0]->n_segments != 3 || format->duration != 12000000 ||
         !hls.playlists[0]->segments[1]->discontinuity ||
         !hls.playlists[0]->segments[2]->discontinuity ||
         hls.playlists[0]->allow_repeated_ad_blocks != allow_repeated ||
@@ -142,10 +142,9 @@ static int check_external_opening(void)
     format->priv_data = &hls;
     ffio_init_read_context(&io, (const uint8_t *)manifest, strlen(manifest));
     if (parse_playlist(&hls, "https://test.invalid/movie/hls/index.m3u8", NULL, &io.pub) < 0 ||
-        hls.n_playlists != 1)
+        hls.n_playlists != 1 || format->duration != 15000000)
         goto end;
     pls = hls.playlists[0];
-    format->duration = 15000000;
     /* Disabled means the original playlist and first request are preserved. */
     apply_ad_detection(&hls);
     if (pls->segments[0]->ad_removed || next_segment(pls) != pls->segments[1])
