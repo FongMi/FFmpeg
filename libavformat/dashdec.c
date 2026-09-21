@@ -2385,7 +2385,9 @@ static int dash_read_packet(AVFormatContext *s, AVPacket *pkt)
     if (!cur) {
         return AVERROR_EOF;
     }
-    while (!ff_check_interrupt(c->interrupt_callback) && !ret) {
+    while (!ret) {
+        if (ff_check_interrupt(c->interrupt_callback))
+            return AVERROR_EXIT;
         ret = av_read_frame(cur->ctx, pkt);
         if (ret >= 0) {
             /* If we got a packet, return it */
@@ -2539,7 +2541,7 @@ static int dash_probe(const AVProbeData *p)
 static const AVOption dash_options[] = {
     {"allowed_extensions", "List of file extensions that dash is allowed to access",
         OFFSET(allowed_extensions), AV_OPT_TYPE_STRING,
-        {.str = "aac,m4a,m4s,m4v,mov,mp4,webm,ts"},
+        {.str = "aac,cmfa,cmfv,m4a,m4s,m4v,mov,mp4,webm,ts"},
         INT_MIN, INT_MAX, FLAGS},
     { "cenc_decryption_key", "Media default decryption key (hex)", OFFSET(cenc_decryption_key), AV_OPT_TYPE_STRING, {.str = NULL}, INT_MIN, INT_MAX, .flags = FLAGS },
     { "cenc_decryption_keys", "Media decryption keys by KID (hex)", OFFSET(cenc_decryption_keys), AV_OPT_TYPE_STRING, {.str = NULL}, INT_MIN, INT_MAX, .flags = FLAGS },
