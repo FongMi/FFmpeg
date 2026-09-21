@@ -797,6 +797,7 @@ TESTPROGS-$(CONFIG_RTPDEC)               += rtpdec
 
 FIFO-MUXER-TESTPROGS-$(CONFIG_NETWORK)   += fifo_muxer
 TESTPROGS-$(CONFIG_FIFO_MUXER)           += $(FIFO-MUXER-TESTPROGS-yes)
+TESTPROGS-$(CONFIG_DASH_DEMUXER)         += dash
 TESTPROGS-$(CONFIG_FFRTMPCRYPT_PROTOCOL) += rtmpdh
 TESTPROGS-$(CONFIG_HLS_DEMUXER)          += hls hls_ad_detect hls_ad_probe hls_playlist hls_timestamp
 TESTPROGS-$(CONFIG_HTTP_PROTOCOL)        += http
