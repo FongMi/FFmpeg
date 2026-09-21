@@ -110,6 +110,16 @@ metadata compression.
 @item strip
 If enabled, strip all Dolby Vision metadata (configuration record + RPU data
 blocks) from the stream.
+@item convert
+Which Dolby Vision profile conversion to apply.
+@table @samp
+@item none
+Do not convert the profile. This is the default.
+@item p81
+Convert profile 7 to profile 8.1. The enhancement layer is discarded, profile
+7 FEL mapping is replaced by identity mapping, and the RPU and configuration
+record are rewritten for an HDR10-compatible base layer.
+@end table
 @item compression
 Which compression level to enable.
 @table @samp
