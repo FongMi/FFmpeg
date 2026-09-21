@@ -126,6 +126,13 @@ int ff_ass_add_rect2(AVSubtitle *sub, const char *dialog,
                      const char *speaker, unsigned *nb_rect_allocated);
 
 /**
+ * Add an ASS dialog with explicit horizontal margins in script coordinates.
+ */
+int ff_ass_add_rect_with_margins(AVSubtitle *sub, const char *dialog,
+                                int readorder, int layer, int margin_l,
+                                int margin_r);
+
+/**
  * Helper to flush a text subtitles decoder making use of the
  * FFASSDecoderContext.
  */

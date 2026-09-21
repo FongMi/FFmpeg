@@ -108,17 +108,25 @@ int ff_ass_subtitle_header_default(AVCodecContext *avctx)
                                ASS_DEFAULT_ALIGNMENT);
 }
 
+static char *ass_get_dialog(int readorder, int layer, const char *style,
+                            const char *speaker, int margin_l, int margin_r,
+                            const char *text)
+{
+    return av_asprintf("%d,%d,%s,%s,%d,%d,0,,%s",
+                       readorder, layer, style ? style : "Default",
+                       speaker ? speaker : "", margin_l, margin_r, text);
+}
+
 char *ff_ass_get_dialog(int readorder, int layer, const char *style,
                         const char *speaker, const char *text)
 {
-    return av_asprintf("%d,%d,%s,%s,0,0,0,,%s",
-                       readorder, layer, style ? style : "Default",
-                       speaker ? speaker : "", text);
+    return ass_get_dialog(readorder, layer, style, speaker, 0, 0, text);
 }
 
-int ff_ass_add_rect2(AVSubtitle *sub, const char *dialog,
-                    int readorder, int layer, const char *style,
-                    const char *speaker, unsigned *nb_rect_allocated)
+static int ass_add_rect(AVSubtitle *sub, const char *dialog,
+                        int readorder, int layer, const char *style,
+                        const char *speaker, int margin_l, int margin_r,
+                        unsigned *nb_rect_allocated)
 {
     AVSubtitleRect **rects = sub->rects, *rect;
     char *ass_str;
@@ -149,11 +157,28 @@ int ff_ass_add_rect2(AVSubtitle *sub, const char *dialog,
         return AVERROR(ENOMEM);
     rects[sub->num_rects++] = rect;
     rect->type = SUBTITLE_ASS;
-    ass_str = ff_ass_get_dialog(readorder, layer, style, speaker, dialog);
+    ass_str = ass_get_dialog(readorder, layer, style, speaker,
+                            margin_l, margin_r, dialog);
     if (!ass_str)
         return AVERROR(ENOMEM);
     rect->ass = ass_str;
     return 0;
+}
+
+int ff_ass_add_rect2(AVSubtitle *sub, const char *dialog,
+                    int readorder, int layer, const char *style,
+                    const char *speaker, unsigned *nb_rect_allocated)
+{
+    return ass_add_rect(sub, dialog, readorder, layer, style, speaker, 0, 0,
+                        nb_rect_allocated);
+}
+
+int ff_ass_add_rect_with_margins(AVSubtitle *sub, const char *dialog,
+                                int readorder, int layer, int margin_l,
+                                int margin_r)
+{
+    return ass_add_rect(sub, dialog, readorder, layer, NULL, NULL, margin_l,
+                        margin_r, NULL);
 }
 
 int ff_ass_add_rect(AVSubtitle *sub, const char *dialog,
