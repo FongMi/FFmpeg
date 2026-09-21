@@ -866,6 +866,13 @@ static int aribcaption_decode(AVCodecContext *avctx, AVSubtitle *sub,
     else
         ctx->pts = av_rescale_q(avpkt->pts, ctx->time_base, (AVRational){1, 1000});
 
+    /* tsreadex timed-ID3 may interleave caption and superimpose PES data. */
+    if (avpkt->size > 0 &&
+        (avpkt->data[0] == ARIBCC_CAPTIONTYPE_CAPTION ||
+         avpkt->data[0] == ARIBCC_CAPTIONTYPE_SUPERIMPOSE))
+        aribcc_decoder_set_caption_type(ctx->decoder,
+                                        (aribcc_captiontype_t)avpkt->data[0]);
+
     status = aribcc_decoder_decode(ctx->decoder, avpkt->data, avpkt->size,
                                    ctx->pts, &ctx->caption);
     if (status == ARIBCC_DECODE_STATUS_ERROR) {

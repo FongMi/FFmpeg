@@ -739,6 +739,7 @@ extern const FFCodec ff_subviewer_decoder;
 extern const FFCodec ff_subviewer1_decoder;
 extern const FFCodec ff_text_encoder;
 extern const FFCodec ff_text_decoder;
+extern const FFCodec ff_ttml_decoder;
 extern const FFCodec ff_ttml_encoder;
 extern const FFCodec ff_vplayer_decoder;
 extern const FFCodec ff_webvtt_encoder;
