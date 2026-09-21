@@ -796,6 +796,7 @@ static int test_segment(AVFormatContext *s, const AVInputFormat *in_fmt, struct 
         } else if (!strcmp(in_fmt->name, "mpegts")) {
             const char *str = "ts,m2t,m2ts,mts,mpg,m4s,mpeg,mpegts"
                               ",html" // https://flash1.bogulus.cfd/
+                              ",bmp,jpeg,jpg,png,gif"  // sites may disguise TS segments as images
                             ;
             matchF =      av_match_ext(    seg->url, str)
                      + 2*(ff_match_url_ext(seg->url, str) > 0);
@@ -808,6 +809,93 @@ static int test_segment(AVFormatContext *s, const AVInputFormat *in_fmt, struct 
             av_log(s, AV_LOG_ERROR, "detected format %s extension %s mismatches allowed extensions in url %s\n", in_fmt->name, in_fmt->extensions ? in_fmt->extensions : "none", seg->url);
             return AVERROR_INVALIDDATA;
         }
+    }
+
+    return 0;
+}
+
+static int has_mpegts_sync_after(const uint8_t *buf, int buf_size, int offset)
+{
+    enum {
+        TS_PACKET_SIZE = 188,
+        TS_SYNC_BYTE = 0x47,
+        TS_PACKETS = 3,
+    };
+
+    if (offset < 0 || offset > buf_size)
+        return 0;
+
+    /* Keep detection tied to the image boundary while allowing a short marker. */
+    for (int start = offset;
+         start - offset < TS_PACKET_SIZE &&
+         buf_size - start >= 1 + (TS_PACKETS - 1) * TS_PACKET_SIZE;
+         start++) {
+        int i;
+
+        for (i = 0; i < TS_PACKETS; i++) {
+            int packet = start + i * TS_PACKET_SIZE;
+
+            if (buf[packet] != TS_SYNC_BYTE)
+                break;
+        }
+        if (i == TS_PACKETS)
+            return 1;
+    }
+
+    return 0;
+}
+
+static int probe_image_wrapped_mpegts(AVIOContext *pb, const char *fmt_name)
+{
+    static const uint8_t png_signature[8] = {
+        0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a
+    };
+    static const uint8_t png_iend[12] = {
+        0x00, 0x00, 0x00, 0x00, 'I', 'E', 'N', 'D',
+        0xae, 0x42, 0x60, 0x82
+    };
+    const uint8_t *buf = pb->buffer;
+    int buf_size = pb->buf_end - pb->buffer;
+
+    if (!strcmp(fmt_name, "png_pipe")) {
+        int sig_size = sizeof(png_signature);
+        int iend_size = sizeof(png_iend);
+
+        if (buf_size < sig_size || memcmp(buf, png_signature, sig_size))
+            return 0;
+
+        for (int pos = sig_size; pos + iend_size <= buf_size; pos++)
+            if (!memcmp(buf + pos, png_iend, iend_size) &&
+                has_mpegts_sync_after(buf, buf_size, pos + iend_size))
+                return 1;
+    } else if (!strcmp(fmt_name, "jpeg_pipe")) {
+        if (buf_size < 4 || buf[0] != 0xff || buf[1] != 0xd8)
+            return 0;
+
+        for (int pos = 2; pos + 1 < buf_size; pos++)
+            if (buf[pos] == 0xff && buf[pos + 1] == 0xd9 &&
+                has_mpegts_sync_after(buf, buf_size, pos + 2))
+                return 1;
+    } else if (!strcmp(fmt_name, "bmp_pipe")) {
+        uint32_t file_size;
+
+        if (buf_size < 14 || buf[0] != 'B' || buf[1] != 'M')
+            return 0;
+
+        file_size = AV_RL32(buf + 2);
+        if (file_size > INT_MAX)
+            return 0;
+
+        return has_mpegts_sync_after(buf, buf_size, file_size);
+    } else if (!strcmp(fmt_name, "gif")) {
+        if (buf_size < 13 ||
+            (memcmp(buf, "GIF87a", 6) && memcmp(buf, "GIF89a", 6)))
+            return 0;
+
+        for (int pos = 13; pos < buf_size; pos++)
+            if (buf[pos] == 0x3b &&
+                has_mpegts_sync_after(buf, buf_size, pos + 1))
+                return 1;
     }
 
     return 0;
@@ -2471,6 +2559,16 @@ static int hls_read_header(AVFormatContext *s)
             pls->ctx->interrupt_callback = s->interrupt_callback;
             url = av_strdup(pls->segments[0]->url);
             ret = av_probe_input_buffer(&pls->pb.pub, &in_fmt, url, NULL, 0, 0);
+            if (ret >= 0 && in_fmt &&
+                probe_image_wrapped_mpegts(&pls->pb.pub, in_fmt->name)) {
+                in_fmt = av_find_input_format("mpegts");
+                if (!in_fmt) {
+                    ret = AVERROR_DEMUXER_NOT_FOUND;
+                } else {
+                    av_log(s, AV_LOG_VERBOSE,
+                           "HLS image-wrapped MPEG-TS segment, using mpegts demuxer\n");
+                }
+            }
 
             for (int n = 0; n < pls->n_segments; n++)
                 if (ret >= 0)
@@ -3042,7 +3140,7 @@ static const AVOption hls_options[] = {
         INT_MIN, INT_MAX, FLAGS},
     {"allowed_segment_extensions", "List of file extensions that hls is allowed to access",
         OFFSET(allowed_segment_extensions), AV_OPT_TYPE_STRING,
-        {.str = "3gp,aac,avi,ac3,eac3,flac,mkv,m3u8,m4a,m4s,m4v,mpg,mov,mp2,mp3,mp4,mpeg,mpegts,ogg,ogv,oga,ts,vob,vtt,wav,webvtt"
+        {.str = "3gp,aac,avi,ac3,bmp,eac3,flac,gif,jpeg,jpg,mkv,m3u8,m4a,m4s,m4v,mpg,mov,mp2,mp3,mp4,mpeg,mpegts,ogg,ogv,oga,png,ts,vob,vtt,wav,webvtt"
             ",cmfv,cmfa" // Ticket11526 www.nicovideo.jp
             ",ec3"       // part of Ticket11435 (Elisa Viihde (Finnish online recording service))
             ",fmp4"      // https://github.com/yt-dlp/yt-dlp/issues/12700
