@@ -1209,5 +1209,11 @@ fate-swr: $(FATE_SWR_SELFTEST-yes)
 
 FATE_SWR += $(FATE_SWR_REALLOC-yes)
 
+FATE_SWR_REMATRIX_HEIGHT-$(CONFIG_SWRESAMPLE) += fate-swr-rematrix-height
+fate-swr-rematrix-height: libswresample/tests/rematrix_height$(EXESUF)
+fate-swr-rematrix-height: CMD = run libswresample/tests/rematrix_height$(EXESUF)
+
+FATE_SWR += $(FATE_SWR_REMATRIX_HEIGHT-yes)
+
 FATE_FFMPEG += $(FATE_SWR)
 fate-swr: $(FATE_SWR)

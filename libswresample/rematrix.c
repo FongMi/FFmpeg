@@ -412,8 +412,20 @@ static void build_matrix(const AVChannelLayout *in_ch_layout, const AVChannelLay
             matrix[SIDE_LEFT ][TOP_BACK_LEFT ] += 1.0;
             matrix[SIDE_RIGHT][TOP_BACK_RIGHT] += 1.0;
         } else if (out_mask & AV_CH_FRONT_LEFT) {
-            matrix[FRONT_LEFT ][TOP_BACK_LEFT ] += surround_mix_level;
-            matrix[FRONT_RIGHT][TOP_BACK_RIGHT] += surround_mix_level;
+            if (matrix_encoding == AV_MATRIX_ENCODING_DOLBY) {
+                matrix[FRONT_LEFT ][TOP_BACK_LEFT ] -= surround_mix_level * M_SQRT1_2;
+                matrix[FRONT_LEFT ][TOP_BACK_RIGHT] -= surround_mix_level * M_SQRT1_2;
+                matrix[FRONT_RIGHT][TOP_BACK_LEFT ] += surround_mix_level * M_SQRT1_2;
+                matrix[FRONT_RIGHT][TOP_BACK_RIGHT] += surround_mix_level * M_SQRT1_2;
+            } else if (matrix_encoding == AV_MATRIX_ENCODING_DPLII) {
+                matrix[FRONT_LEFT ][TOP_BACK_LEFT ] -= surround_mix_level * SQRT3_2;
+                matrix[FRONT_LEFT ][TOP_BACK_RIGHT] -= surround_mix_level * M_SQRT1_2;
+                matrix[FRONT_RIGHT][TOP_BACK_LEFT ] += surround_mix_level * M_SQRT1_2;
+                matrix[FRONT_RIGHT][TOP_BACK_RIGHT] += surround_mix_level * SQRT3_2;
+            } else {
+                matrix[FRONT_LEFT ][TOP_BACK_LEFT ] += surround_mix_level;
+                matrix[FRONT_RIGHT][TOP_BACK_RIGHT] += surround_mix_level;
+            }
         } else if (out_mask & AV_CH_FRONT_CENTER) {
             matrix[FRONT_CENTER][TOP_BACK_LEFT ] += surround_mix_level*M_SQRT1_2;
             matrix[FRONT_CENTER][TOP_BACK_RIGHT] += surround_mix_level*M_SQRT1_2;

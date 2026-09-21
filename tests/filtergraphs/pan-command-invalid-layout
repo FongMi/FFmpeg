@@ -1,0 +1,1 @@
+asendcmd=c='0.02 pan@mix remix stereo|c0=c0|c1=c1;0.06 pan@mix remix FL+FR+FC+LFE+SL+SR|c0=0.25*c0|c1=c1|c2=c2|c3=c3|c4=c4|c5=c5',pan@mix=FL+FR+FC+LFE+SL+SR|c0=c0|c1=c1|c2=c2|c3=c3|c4=c4|c5=c5
