@@ -43,6 +43,11 @@ fate-golomb: libavcodec/tests/golomb$(EXESUF)
 fate-golomb: CMD = run libavcodec/tests/golomb$(EXESUF)
 fate-golomb: CMP = null
 
+FATE_LIBAVCODEC-$(CONFIG_HEVCPARSE) += fate-h2645-parse
+fate-h2645-parse: libavcodec/tests/h2645_parse$(EXESUF)
+fate-h2645-parse: CMD = run libavcodec/tests/h2645_parse$(EXESUF)
+fate-h2645-parse: CMP = null
+
 FATE_LIBAVCODEC-$(CONFIG_DXV_ENCODER) += fate-hashtable
 fate-hashtable: libavcodec/tests/hashtable$(EXESUF)
 fate-hashtable: CMD = run libavcodec/tests/hashtable$(EXESUF)

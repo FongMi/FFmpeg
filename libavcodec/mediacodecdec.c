@@ -27,17 +27,22 @@
 
 #include "libavutil/avassert.h"
 #include "libavutil/common.h"
+#include "libavutil/dovi_meta.h"
 #include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "libavutil/intreadwrite.h"
+#include "libavutil/pixdesc.h"
 #include "libavutil/pixfmt.h"
 #include "libavutil/internal.h"
 
 #include "avcodec.h"
 #include "codec_internal.h"
 #include "decode.h"
+#include "dovi_rpu.h"
 #include "h264_parse.h"
+#include "h2645_parse.h"
 #include "h264_ps.h"
+#include "hevc/hevc.h"
 #include "hevc/parse.h"
 #include "hwconfig.h"
 #include "internal.h"
@@ -59,6 +64,16 @@ typedef struct MediaCodecH264DecContext {
     int use_ndk_codec;
     // Ref. MediaFormat KEY_OPERATING_RATE
     int operating_rate;
+    int dovi_sink_support;
+    int dovi_gpu_mapping_support;
+
+#if CONFIG_HEVC_MEDIACODEC_DECODER
+    HEVCParamSets hevc_ps;
+    HEVCSEI hevc_sei;
+    H2645Packet hevc_metadata_pkt;
+    DOVIContext dovi_ctx;
+    AVFrame *buffered_frame_props;
+#endif
 } MediaCodecH264DecContext;
 
 static av_cold int mediacodec_decode_close(AVCodecContext *avctx)
@@ -69,6 +84,14 @@ static av_cold int mediacodec_decode_close(AVCodecContext *avctx)
     s->ctx = NULL;
 
     av_packet_unref(&s->buffered_pkt);
+
+#if CONFIG_HEVC_MEDIACODEC_DECODER
+    av_frame_free(&s->buffered_frame_props);
+    ff_h2645_packet_uninit(&s->hevc_metadata_pkt);
+    ff_hevc_ps_uninit(&s->hevc_ps);
+    ff_hevc_reset_sei(&s->hevc_sei);
+    ff_dovi_ctx_unref(&s->dovi_ctx);
+#endif
 
     return 0;
 }
@@ -194,11 +217,11 @@ done:
 #if CONFIG_HEVC_MEDIACODEC_DECODER
 static int hevc_set_extradata(AVCodecContext *avctx, FFAMediaFormat *format)
 {
+    MediaCodecH264DecContext *s = avctx->priv_data;
+    HEVCParamSets *ps = &s->hevc_ps;
+    HEVCSEI *sei = &s->hevc_sei;
     int i;
     int ret;
-
-    HEVCParamSets ps = {0};
-    HEVCSEI sei = {0};
 
     const HEVCVPS *vps = NULL;
     const HEVCPPS *pps = NULL;
@@ -214,28 +237,27 @@ static int hevc_set_extradata(AVCodecContext *avctx, FFAMediaFormat *format)
     int pps_data_size = 0;
 
     ret = ff_hevc_decode_extradata(avctx->extradata, avctx->extradata_size,
-                                   &ps, &sei, &is_nalff, &nal_length_size, 0, 1, avctx);
-    if (ret < 0) {
+                                   ps, sei, &is_nalff, &nal_length_size, 0, 1, avctx);
+    if (ret < 0)
         goto done;
-    }
 
     for (i = 0; i < HEVC_MAX_VPS_COUNT; i++) {
-        if (ps.vps_list[i]) {
-            vps = ps.vps_list[i];
+        if (ps->vps_list[i]) {
+            vps = ps->vps_list[i];
             break;
         }
     }
 
     for (i = 0; i < HEVC_MAX_PPS_COUNT; i++) {
-        if (ps.pps_list[i]) {
-            pps = ps.pps_list[i];
+        if (ps->pps_list[i]) {
+            pps = ps->pps_list[i];
             break;
         }
     }
 
     if (pps) {
-        if (ps.sps_list[pps->sps_id]) {
-            sps = ps.sps_list[pps->sps_id];
+        if (ps->sps_list[pps->sps_id]) {
+            sps = ps->sps_list[pps->sps_id];
         }
     }
 
@@ -274,13 +296,198 @@ static int hevc_set_extradata(AVCodecContext *avctx, FFAMediaFormat *format)
     }
 
 done:
-    ff_hevc_ps_uninit(&ps);
-
     av_freep(&vps_data);
     av_freep(&sps_data);
     av_freep(&pps_data);
 
     return ret;
+}
+
+static void mediacodec_reset_unexported_hevc_sei(HEVCSEI *sei)
+{
+    H2645SEIMasteringDisplay mastering_display =
+        sei->common.mastering_display;
+    H2645SEIContentLight content_light = sei->common.content_light;
+    AVBufferRef *dynamic_hdr_plus = sei->common.itut_t35.hdr_plus;
+
+    /* Preserve the HDR state that applies until replaced while releasing SEI
+     * payloads this decoder does not export. */
+    sei->common.itut_t35.hdr_plus = NULL;
+    ff_hevc_reset_sei(sei);
+    sei->common.mastering_display = mastering_display;
+    sei->common.content_light = content_light;
+    sei->common.itut_t35.hdr_plus = dynamic_hdr_plus;
+}
+
+static int mediacodec_extract_hevc_metadata(AVCodecContext *avctx,
+                                            MediaCodecH264DecContext *s,
+                                            const AVPacket *pkt,
+                                            AVFrame *frame)
+{
+    H2645NAL *rpu_nal = NULL;
+    const uint8_t *side_data;
+    size_t side_data_size;
+    bool require_dovi_mapping;
+    int ret;
+
+    av_frame_unref(frame);
+
+    /* Native Dolby Vision decoders consume the untouched RPU in the coded
+     * stream. Parsing it again is unnecessary and would add CPU work to the
+     * direct-output path. */
+    if (s->ctx->native_dovi)
+        return 0;
+
+    side_data = av_packet_get_side_data(pkt, AV_PKT_DATA_DOVI_CONF,
+                                        &side_data_size);
+    if (side_data && side_data_size >= sizeof(s->dovi_ctx.cfg))
+        memcpy(&s->dovi_ctx.cfg, side_data, sizeof(s->dovi_ctx.cfg));
+
+    if (s->dovi_ctx.cfg.dv_profile == 5) {
+        if (s->dovi_gpu_mapping_support != 1) {
+            av_log(avctx, AV_LOG_ERROR,
+                   "Dolby Vision profile 5 discovered after decoder "
+                   "initialization, but GPU mapping is unavailable\n");
+            return AVERROR(ENOSYS);
+        }
+        s->ctx->require_dovi_mapping = true;
+    }
+    require_dovi_mapping = s->ctx->require_dovi_mapping;
+
+    /* Well-described SDR and HLG streams do not carry the PQ/Dolby metadata
+     * exported here. Avoid scanning their compressed access units. */
+    if (!s->dovi_ctx.cfg.dv_profile &&
+        avctx->color_trc != AVCOL_TRC_SMPTE2084 &&
+        avctx->color_trc != AVCOL_TRC_UNSPECIFIED)
+        return 0;
+
+    ret = ff_h2645_packet_split(&s->hevc_metadata_pkt,
+                                pkt->data, pkt->size, avctx, 0,
+                                AV_CODEC_ID_HEVC,
+                                H2645_FLAG_SMALL_PADDING |
+                                H2645_FLAG_HEVC_METADATA_ONLY);
+    if (ret < 0) {
+        if (ret == AVERROR(ENOMEM))
+            return ret;
+        if (require_dovi_mapping) {
+            av_log(avctx, AV_LOG_ERROR,
+                   "Could not inspect HEVC metadata required for Dolby Vision "
+                   "GPU mapping: %s\n", av_err2str(ret));
+            return ret;
+        }
+        av_log(avctx, AV_LOG_DEBUG,
+               "Could not inspect HEVC metadata NAL units: %s\n",
+               av_err2str(ret));
+        return 0;
+    }
+
+    for (int i = 0; i < s->hevc_metadata_pkt.nb_nals; i++) {
+        H2645NAL *nal = &s->hevc_metadata_pkt.nals[i];
+
+        switch (nal->type) {
+        case HEVC_NAL_VPS:
+            ret = ff_hevc_decode_nal_vps(&nal->gb, avctx, &s->hevc_ps);
+            break;
+        case HEVC_NAL_SPS:
+            ret = ff_hevc_decode_nal_sps(&nal->gb, avctx, &s->hevc_ps,
+                                         nal->nuh_layer_id, 1);
+            break;
+        case HEVC_NAL_PPS:
+            ret = ff_hevc_decode_nal_pps(&nal->gb, avctx, &s->hevc_ps);
+            break;
+        case HEVC_NAL_SEI_PREFIX:
+        case HEVC_NAL_SEI_SUFFIX:
+            ret = ff_hevc_decode_nal_sei(&nal->gb, avctx, &s->hevc_sei,
+                                         &s->hevc_ps, nal->type);
+            break;
+        case HEVC_NAL_UNSPEC62:
+            ret = 0;
+            if (nal->size > 2 && nal->raw_size > 2 &&
+                !nal->nuh_layer_id && !nal->temporal_id)
+                rpu_nal = nal;
+            break;
+        default:
+            av_assert0(0);
+        }
+
+        if (ret == AVERROR(ENOMEM))
+            return ret;
+        if (ret < 0)
+            av_log(avctx, AV_LOG_WARNING,
+                   "Ignoring invalid HEVC metadata NAL unit type %d: %s\n",
+                   nal->type, av_err2str(ret));
+    }
+
+    ret = ff_h2645_sei_hdr_to_frame(frame, &s->hevc_sei.common, avctx);
+    if (ret < 0)
+        return ret;
+
+    if (require_dovi_mapping && !rpu_nal) {
+        av_log(avctx, AV_LOG_ERROR,
+               "Dolby Vision profile 5 frame has no RPU for required GPU mapping\n");
+        return AVERROR_INVALIDDATA;
+    }
+
+    if (s->hevc_sei.common.itut_t35.hdr_plus) {
+        AVBufferRef *info =
+            av_buffer_ref(s->hevc_sei.common.itut_t35.hdr_plus);
+
+        if (!info)
+            return AVERROR(ENOMEM);
+        if (!av_frame_new_side_data_from_buf(frame,
+                                             AV_FRAME_DATA_DYNAMIC_HDR_PLUS,
+                                             info)) {
+            av_buffer_unref(&info);
+            return AVERROR(ENOMEM);
+        }
+    }
+
+    if (s->hevc_sei.common.alternative_transfer.present) {
+        int trc = s->hevc_sei.common.alternative_transfer
+                                     .preferred_transfer_characteristics;
+
+        if (trc != AVCOL_TRC_UNSPECIFIED && av_color_transfer_name(trc))
+            frame->color_trc = trc;
+    }
+
+    if (rpu_nal) {
+        AVBufferRef *rpu = av_buffer_alloc(rpu_nal->raw_size - 2);
+
+        if (!rpu)
+            return AVERROR(ENOMEM);
+        memcpy(rpu->data, rpu_nal->raw_data + 2, rpu_nal->raw_size - 2);
+
+        ret = ff_dovi_rpu_parse(&s->dovi_ctx,
+                                rpu_nal->data + 2, rpu_nal->size - 2,
+                                avctx->err_recognition);
+        if (ret < 0) {
+            av_buffer_unref(&rpu);
+            if (ret == AVERROR(ENOMEM))
+                return ret;
+            if (require_dovi_mapping) {
+                av_log(avctx, AV_LOG_ERROR,
+                       "Invalid Dolby Vision RPU required for GPU mapping: %s\n",
+                       av_err2str(ret));
+                return ret;
+            }
+            av_log(avctx, AV_LOG_WARNING,
+                   "Ignoring invalid Dolby Vision RPU: %s\n",
+                   av_err2str(ret));
+        } else {
+            if (!av_frame_new_side_data_from_buf(frame,
+                                                 AV_FRAME_DATA_DOVI_RPU_BUFFER,
+                                                 rpu)) {
+                av_buffer_unref(&rpu);
+                return AVERROR(ENOMEM);
+            }
+            ret = ff_dovi_attach_side_data(&s->dovi_ctx, frame);
+            if (ret < 0)
+                return ret;
+        }
+    }
+
+    mediacodec_reset_unexported_hevc_sei(&s->hevc_sei);
+    return 0;
 }
 #endif
 
@@ -305,24 +512,72 @@ static int common_set_extradata(AVCodecContext *avctx, FFAMediaFormat *format)
 }
 #endif
 
-static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
+static const AVDOVIDecoderConfigurationRecord *
+mediacodec_get_dovi_config(AVCodecContext *avctx)
 {
-    int ret;
-    int sdk_int;
+    const AVPacketSideData *sd =
+        ff_get_coded_side_data(avctx, AV_PKT_DATA_DOVI_CONF);
 
-    const char *codec_mime = NULL;
+    if (!sd || sd->size < sizeof(AVDOVIDecoderConfigurationRecord))
+        return NULL;
 
+    return (const AVDOVIDecoderConfigurationRecord *)sd->data;
+}
+
+static int mediacodec_dovi_has_compatible_base_layer(
+    AVCodecContext *avctx,
+    const AVDOVIDecoderConfigurationRecord *dovi)
+{
+    /* Only use explicitly present, independently decodable base layers. */
+    if (!dovi->bl_present_flag)
+        return 0;
+
+    switch (dovi->dv_profile) {
+    case 0:
+        return avctx->codec_id == AV_CODEC_ID_H264;
+    case 2:
+    case 4:
+    case 6:
+    case 7:
+        return avctx->codec_id == AV_CODEC_ID_HEVC;
+    case 8:
+        return avctx->codec_id == AV_CODEC_ID_HEVC &&
+               (dovi->dv_bl_signal_compatibility_id == 1 ||
+                dovi->dv_bl_signal_compatibility_id == 2 ||
+                dovi->dv_bl_signal_compatibility_id == 4);
+    case 9:
+        return avctx->codec_id == AV_CODEC_ID_H264;
+    case 10:
+        return avctx->codec_id == AV_CODEC_ID_AV1 &&
+               (dovi->dv_bl_signal_compatibility_id == 1 ||
+                dovi->dv_bl_signal_compatibility_id == 2 ||
+                dovi->dv_bl_signal_compatibility_id == 4);
+    default:
+        return 0;
+    }
+}
+
+static int mediacodec_dovi_can_gpu_map(
+    AVCodecContext *avctx,
+    const AVDOVIDecoderConfigurationRecord *dovi)
+{
+    return avctx->codec_id == AV_CODEC_ID_HEVC && dovi->dv_profile == 5;
+}
+
+static av_cold int mediacodec_init_decoder(AVCodecContext *avctx,
+                                           MediaCodecH264DecContext *s,
+                                           const AVDOVIDecoderConfigurationRecord *dovi)
+{
     FFAMediaFormat *format = NULL;
-    MediaCodecH264DecContext *s = avctx->priv_data;
-
-    if (s->use_ndk_codec < 0)
-        s->use_ndk_codec = !av_jni_get_java_vm(avctx);
+    const char *codec_mime = NULL;
+    int format_profile = -1;
+    bool native_dovi = false;
+    int ret;
 
     format = ff_AMediaFormat_new(s->use_ndk_codec);
     if (!format) {
         av_log(avctx, AV_LOG_ERROR, "Failed to create media format\n");
-        ret = AVERROR_EXTERNAL;
-        goto done;
+        return AVERROR_EXTERNAL;
     }
 
     switch (avctx->codec_id) {
@@ -364,7 +619,7 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
 #endif
 #if CONFIG_MPEG4_MEDIACODEC_DECODER
     case AV_CODEC_ID_MPEG4:
-        codec_mime = "video/mp4v-es",
+        codec_mime = "video/mp4v-es";
 
         ret = common_set_extradata(avctx, format);
         if (ret < 0)
@@ -429,11 +684,28 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
         av_assert0(0);
     }
 
+    if (dovi && dovi->dv_profile <= 10) {
+        codec_mime = FF_MEDIACODEC_MIME_DOLBY_VISION;
+        format_profile = 1 << dovi->dv_profile;
+        native_dovi = true;
+        av_log(avctx, AV_LOG_INFO,
+               "Dolby Vision profile %u detected, requesting a "
+               "Dolby Vision MediaCodec decoder\n",
+               dovi->dv_profile);
+    } else if (dovi) {
+        av_log(avctx, AV_LOG_WARNING,
+               "Unsupported Dolby Vision profile %u, using the base-layer decoder\n",
+               dovi->dv_profile);
+    }
+
     ff_AMediaFormat_setString(format, "mime", codec_mime);
+    if (format_profile >= 0)
+        ff_AMediaFormat_setInt32(format, "profile", format_profile);
 
     if (avctx->codec_type == AVMEDIA_TYPE_VIDEO) {
         ff_AMediaFormat_setInt32(format, "width", avctx->width);
         ff_AMediaFormat_setInt32(format, "height", avctx->height);
+        ff_mediacodec_dec_set_input_color(avctx, format);
     } else {
         ff_AMediaFormat_setInt32(format, "channel-count", avctx->ch_layout.nb_channels);
         ff_AMediaFormat_setInt32(format, "sample-rate", avctx->sample_rate);
@@ -450,11 +722,84 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
 
     s->ctx->delay_flush = s->delay_flush;
     s->ctx->use_ndk_codec = s->use_ndk_codec;
+    s->ctx->native_dovi = native_dovi;
 
     if ((ret = ff_mediacodec_dec_init(avctx, s->ctx, codec_mime, format)) < 0) {
         s->ctx = NULL;
         goto done;
     }
+
+done:
+    ff_AMediaFormat_delete(format);
+    return ret;
+}
+
+static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
+{
+    const AVDOVIDecoderConfigurationRecord *dovi;
+    const AVDOVIDecoderConfigurationRecord *decoder_dovi;
+    MediaCodecH264DecContext *s = avctx->priv_data;
+    int sdk_int;
+    int ret;
+
+    if (s->use_ndk_codec < 0)
+        s->use_ndk_codec = !av_jni_get_java_vm(avctx);
+
+    dovi = avctx->codec_type == AVMEDIA_TYPE_VIDEO
+           ? mediacodec_get_dovi_config(avctx)
+           : NULL;
+    decoder_dovi = dovi;
+
+    /* Native Dolby Vision is safe only when the caller has positively
+     * identified a compatible output sink. Raw profile 5 may instead use the
+     * regular HEVC decoder only when the caller can preserve its samples and
+     * apply the parsed RPU metadata in a GPU renderer. */
+    if (dovi && s->dovi_sink_support != 1) {
+        if (!mediacodec_dovi_has_compatible_base_layer(avctx, dovi)) {
+            if (s->dovi_gpu_mapping_support != 1 ||
+                !mediacodec_dovi_can_gpu_map(avctx, dovi)) {
+                av_log(avctx, AV_LOG_WARNING,
+                       "Native Dolby Vision output is unavailable and profile %u "
+                       "cannot use the active GPU mapping path; refusing MediaCodec\n",
+                       dovi->dv_profile);
+                return AVERROR(ENOSYS);
+            }
+            av_log(avctx, AV_LOG_INFO,
+                   "Native Dolby Vision output is unavailable, decoding raw "
+                   "profile 5 for GPU mapping\n");
+        } else {
+            av_log(avctx, AV_LOG_INFO,
+                   "Native Dolby Vision output is unavailable, using the "
+                   "base-layer decoder for profile %u\n",
+                   dovi->dv_profile);
+        }
+        decoder_dovi = NULL;
+    }
+
+    ret = mediacodec_init_decoder(avctx, s, decoder_dovi);
+    if (ret < 0)
+        goto fail;
+
+    s->ctx->require_dovi_mapping =
+        !s->ctx->native_dovi && s->dovi_gpu_mapping_support == 1 && dovi &&
+        mediacodec_dovi_can_gpu_map(avctx, dovi);
+
+#if CONFIG_HEVC_MEDIACODEC_DECODER
+    if (avctx->codec_id == AV_CODEC_ID_HEVC && !s->ctx->native_dovi) {
+        ret = ff_h2645_sei_to_context(avctx, &s->hevc_sei.common);
+        if (ret < 0)
+            goto fail;
+
+        s->buffered_frame_props = av_frame_alloc();
+        if (!s->buffered_frame_props) {
+            ret = AVERROR(ENOMEM);
+            goto fail;
+        }
+        s->dovi_ctx.logctx = avctx;
+        if (dovi)
+            s->dovi_ctx.cfg = *dovi;
+    }
+#endif
 
     av_log(avctx, AV_LOG_INFO,
            "MediaCodec started successfully: codec = %s, ret = %d\n",
@@ -474,23 +819,24 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
         s->amlogic_mpeg2_api23_workaround = 1;
     }
 
-done:
-    if (format) {
-        ff_AMediaFormat_delete(format);
-    }
+    return ret;
 
-    if (ret < 0) {
-        mediacodec_decode_close(avctx);
-    }
-
+fail:
+    mediacodec_decode_close(avctx);
     return ret;
 }
 
 static int mediacodec_receive_frame(AVCodecContext *avctx, AVFrame *frame)
 {
     MediaCodecH264DecContext *s = avctx->priv_data;
+    const AVFrame *frame_props = NULL;
     int ret;
     ssize_t index;
+
+#if CONFIG_HEVC_MEDIACODEC_DECODER
+    if (avctx->codec_id == AV_CODEC_ID_HEVC)
+        frame_props = s->buffered_frame_props;
+#endif
 
     /* In delay_flush mode, wait until the user has released or rendered
        all retained frames. */
@@ -528,12 +874,17 @@ static int mediacodec_receive_frame(AVCodecContext *avctx, AVFrame *frame)
 
         /* try to flush any buffered packet data */
         if (s->buffered_pkt.size > 0) {
-            ret = ff_mediacodec_dec_send(avctx, s->ctx, &s->buffered_pkt, false);
+            ret = ff_mediacodec_dec_send(avctx, s->ctx, &s->buffered_pkt,
+                                         frame_props, false);
             if (ret >= 0) {
                 s->buffered_pkt.size -= ret;
                 s->buffered_pkt.data += ret;
                 if (s->buffered_pkt.size <= 0) {
                     av_packet_unref(&s->buffered_pkt);
+#if CONFIG_HEVC_MEDIACODEC_DECODER
+                    if (frame_props)
+                        av_frame_unref(s->buffered_frame_props);
+#endif
                 } else {
                     av_log(avctx, AV_LOG_WARNING,
                            "could not send entire packet in single input buffer (%d < %d)\n",
@@ -555,7 +906,7 @@ static int mediacodec_receive_frame(AVCodecContext *avctx, AVFrame *frame)
         ret = ff_decode_get_packet(avctx, &s->buffered_pkt);
         if (ret == AVERROR_EOF) {
             AVPacket null_pkt = { 0 };
-            ret = ff_mediacodec_dec_send(avctx, s->ctx, &null_pkt, true);
+            ret = ff_mediacodec_dec_send(avctx, s->ctx, &null_pkt, NULL, true);
             if (ret < 0)
                 return ret;
             return ff_mediacodec_dec_receive(avctx, s->ctx, frame, true);
@@ -564,6 +915,19 @@ static int mediacodec_receive_frame(AVCodecContext *avctx, AVFrame *frame)
         } else if (ret < 0) {
             return ret;
         }
+
+#if CONFIG_HEVC_MEDIACODEC_DECODER
+        if (frame_props) {
+            ret = mediacodec_extract_hevc_metadata(avctx, s,
+                                                   &s->buffered_pkt,
+                                                   s->buffered_frame_props);
+            if (ret < 0) {
+                av_packet_unref(&s->buffered_pkt);
+                av_frame_unref(s->buffered_frame_props);
+                return ret;
+            }
+        }
+#endif
     }
 
     return AVERROR(EAGAIN);
@@ -574,6 +938,15 @@ static void mediacodec_decode_flush(AVCodecContext *avctx)
     MediaCodecH264DecContext *s = avctx->priv_data;
 
     av_packet_unref(&s->buffered_pkt);
+
+#if CONFIG_HEVC_MEDIACODEC_DECODER
+    if (avctx->codec_id == AV_CODEC_ID_HEVC) {
+        if (s->buffered_frame_props)
+            av_frame_unref(s->buffered_frame_props);
+        ff_hevc_reset_sei(&s->hevc_sei);
+        ff_dovi_ctx_flush(&s->dovi_ctx);
+    }
+#endif
 
     ff_mediacodec_dec_flush(avctx, s->ctx);
 }
@@ -600,6 +973,12 @@ static const AVOption ff_mediacodec_vdec_options[] = {
                    OFFSET(use_ndk_codec), AV_OPT_TYPE_BOOL, {.i64 = -1}, -1, 1, VD },
     { "operating_rate", "The desired operating rate that the codec will need to operate at, zero for unspecified",
             OFFSET(operating_rate), AV_OPT_TYPE_INT, {.i64 = 0}, 0, INT_MAX, VD },
+    { "dovi_sink_support", "Whether the output sink positively supports native Dolby Vision "
+                           "(-1 unspecified, 0 no, 1 yes); only 1 enables native output",
+            OFFSET(dovi_sink_support), AV_OPT_TYPE_BOOL, {.i64 = -1}, -1, 1, VD },
+    { "dovi_gpu_mapping_support", "Whether the output path can preserve raw Dolby Vision "
+                                  "samples and apply parsed metadata on the GPU",
+            OFFSET(dovi_gpu_mapping_support), AV_OPT_TYPE_BOOL, {.i64 = -1}, -1, 1, VD },
     { NULL }
 };
 
@@ -625,7 +1004,7 @@ const FFCodec ff_ ## short_name ## _mediacodec_decoder = {                      
     .flush          = mediacodec_decode_flush,                                                 \
     .close          = mediacodec_decode_close,                                                 \
     .p.capabilities = AV_CODEC_CAP_DELAY | AV_CODEC_CAP_AVOID_PROBING | AV_CODEC_CAP_HARDWARE, \
-    .caps_internal  = FF_CODEC_CAP_NOT_INIT_THREADSAFE,                                        \
+    .caps_internal  = FF_CODEC_CAP_NOT_INIT_THREADSAFE | FF_CODEC_CAP_SETS_FRAME_PROPS,        \
     .bsfs           = bsf,                                                                     \
     .hw_configs     = mediacodec_hw_configs,                                                   \
     .p.wrapper_name = "mediacodec",                                                            \
@@ -690,7 +1069,7 @@ const FFCodec ff_ ## short_name ## _mediacodec_decoder = {                      
     .flush          = mediacodec_decode_flush,                                                 \
     .close          = mediacodec_decode_close,                                                 \
     .p.capabilities = AV_CODEC_CAP_DELAY | AV_CODEC_CAP_HARDWARE,                              \
-    .caps_internal  = FF_CODEC_CAP_NOT_INIT_THREADSAFE,                                        \
+    .caps_internal  = FF_CODEC_CAP_NOT_INIT_THREADSAFE | FF_CODEC_CAP_SETS_FRAME_PROPS,        \
     .bsfs           = bsf,                                                                     \
     .p.wrapper_name = "mediacodec",                                                            \
 };                                                                                             \
