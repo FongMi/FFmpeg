@@ -51,6 +51,14 @@ fate-seek_utils: libavformat/tests/seek_utils$(EXESUF)
 fate-seek_utils: CMD = run libavformat/tests/seek_utils$(EXESUF)
 fate-seek_utils: CMP = null
 
+FATE_LIBAVFORMAT-$(CONFIG_HLS_DEMUXER) += fate-hls_ad_detect fate-hls_timestamp
+fate-hls_ad_detect: libavformat/tests/hls_ad_detect$(EXESUF)
+fate-hls_ad_detect: CMD = run libavformat/tests/hls_ad_detect$(EXESUF)
+fate-hls_ad_detect: CMP = null
+fate-hls_timestamp: libavformat/tests/hls_timestamp$(EXESUF)
+fate-hls_timestamp: CMD = run libavformat/tests/hls_timestamp$(EXESUF)
+fate-hls_timestamp: CMP = null
+
 FATE_LIBAVFORMAT += $(FATE_LIBAVFORMAT-yes)
 FATE-$(CONFIG_AVFORMAT) += $(FATE_LIBAVFORMAT)
 fate-libavformat: $(FATE_LIBAVFORMAT)
