@@ -50,6 +50,8 @@ typedef struct Libdav1dContext {
     int pool_size;
 
     Dav1dData data;
+    int direct_rendering;
+    int use_get_buffer2;
     int max_frame_delay;
     int apply_grain;
     int operating_point;
@@ -74,9 +76,125 @@ static void libdav1d_log_callback(void *opaque, const char *fmt, va_list vl)
     av_vlog(c, AV_LOG_ERROR, fmt, vl);
 }
 
-static int libdav1d_picture_allocator(Dav1dPicture *p, void *cookie)
+static int libdav1d_buffer_contains(const AVBufferRef *buffer,
+                                    const uint8_t *data, size_t size)
 {
-    Libdav1dContext *dav1d = cookie;
+    uintptr_t buffer_addr = (uintptr_t)buffer->data;
+    uintptr_t data_addr = (uintptr_t)data;
+    size_t offset;
+
+    if (data_addr < buffer_addr)
+        return 0;
+
+    offset = data_addr - buffer_addr;
+    return offset <= buffer->size && size <= buffer->size - offset;
+}
+
+static enum AVPixelFormat libdav1d_get_pixel_format(
+    const AVCodecContext *c, const Dav1dSequenceHeader *seq)
+{
+    enum AVColorSpace colorspace = c->colorspace;
+
+    if (seq->color_description_present)
+        colorspace = (enum AVColorSpace)seq->mtrx;
+
+    if (seq->layout == DAV1D_PIXEL_LAYOUT_I444 &&
+        colorspace == AVCOL_SPC_RGB)
+        return pix_fmt_rgb[seq->hbd];
+
+    return pix_fmt[seq->layout][seq->hbd];
+}
+
+static int libdav1d_validate_frame(AVFrame *frame, const Dav1dPicture *p,
+                                   enum AVPixelFormat format,
+                                   int width, int height)
+{
+    const int bytes_per_sample = p->p.bpc > 8 ? 2 : 1;
+    const int planes = p->p.layout == DAV1D_PIXEL_LAYOUT_I400 ? 1 : 3;
+    const int chroma_shift_w =
+        p->p.layout == DAV1D_PIXEL_LAYOUT_I420 ||
+        p->p.layout == DAV1D_PIXEL_LAYOUT_I422;
+    const int chroma_shift_h = p->p.layout == DAV1D_PIXEL_LAYOUT_I420;
+
+    if (frame->private_ref || frame->format != format ||
+        frame->width != width || frame->height != height ||
+        !av_frame_is_writable(frame))
+        return 0;
+
+    for (int i = 0; i < planes; i++) {
+        const int plane_width = i ? width >> chroma_shift_w : width;
+        const int plane_height = i ? height >> chroma_shift_h : height;
+        const int linesize = frame->linesize[i];
+        const AVBufferRef *plane_buffer;
+        size_t plane_size;
+
+        if (!frame->data[i] ||
+            (uintptr_t)frame->data[i] % DAV1D_PICTURE_ALIGNMENT ||
+            linesize <= 0 || linesize % DAV1D_PICTURE_ALIGNMENT ||
+            (size_t)linesize < (size_t)plane_width * bytes_per_sample)
+            return 0;
+        if ((size_t)plane_height >
+            (SIZE_MAX - DAV1D_PICTURE_ALIGNMENT) / linesize)
+            return 0;
+
+        plane_size = (size_t)linesize * plane_height +
+                     DAV1D_PICTURE_ALIGNMENT;
+        plane_buffer = av_frame_get_plane_buffer(frame, i);
+        if (!plane_buffer ||
+            !libdav1d_buffer_contains(plane_buffer, frame->data[i],
+                                      plane_size))
+            return 0;
+    }
+
+    return planes == 1 || frame->linesize[1] == frame->linesize[2];
+}
+
+static int libdav1d_alloc_picture_with_get_buffer(AVCodecContext *c,
+                                                  Dav1dPicture *p)
+{
+    const enum AVPixelFormat format =
+        libdav1d_get_pixel_format(c, p->seq_hdr);
+    AVFrame *frame;
+    int height = FFALIGN(p->p.h, 128);
+    int width = FFALIGN(p->p.w, 128);
+    int ret;
+
+    frame = av_frame_alloc();
+    if (!frame)
+        return AVERROR(ENOMEM);
+
+    frame->format = format;
+    frame->width = width;
+    frame->height = height;
+
+    ret = c->get_buffer2(c, frame, AV_GET_BUFFER_FLAG_REF);
+    if (ret < 0)
+        goto fail;
+    if (!libdav1d_validate_frame(frame, p, format, width, height)) {
+        av_log(c, AV_LOG_ERROR,
+               "get_buffer2 returned a buffer incompatible with libdav1d\n");
+        ret = AVERROR(EINVAL);
+        goto fail;
+    }
+
+    frame->width = p->p.w;
+    frame->height = p->p.h;
+    p->data[0] = frame->data[0];
+    p->data[1] = frame->data[1];
+    p->data[2] = frame->data[2];
+    p->stride[0] = frame->linesize[0];
+    p->stride[1] = frame->linesize[1];
+    p->allocator_data = frame;
+    return 0;
+
+fail:
+    av_frame_free(&frame);
+    return ret;
+}
+
+static int libdav1d_alloc_picture_internal(AVCodecContext *c, Dav1dPicture *p)
+{
+    Libdav1dContext *dav1d = c->priv_data;
     enum AVPixelFormat format = pix_fmt[p->p.layout][p->seq_hdr->hbd];
     int ret, linesize[4], h = FFALIGN(p->p.h, 128), w = FFALIGN(p->p.w, 128);
     uint8_t *aligned_ptr, *data[4];
@@ -122,11 +240,31 @@ static int libdav1d_picture_allocator(Dav1dPicture *p, void *cookie)
     return 0;
 }
 
+static int libdav1d_picture_allocator(Dav1dPicture *p, void *cookie)
+{
+    AVCodecContext *c = cookie;
+    Libdav1dContext *dav1d = c->priv_data;
+
+    if (dav1d->use_get_buffer2)
+        return libdav1d_alloc_picture_with_get_buffer(c, p);
+
+    return libdav1d_alloc_picture_internal(c, p);
+}
+
 static void libdav1d_picture_release(Dav1dPicture *p, void *cookie)
 {
-    AVBufferRef *buf = p->allocator_data;
+    AVCodecContext *c = cookie;
+    Libdav1dContext *dav1d = c->priv_data;
 
-    av_buffer_unref(&buf);
+    if (dav1d->use_get_buffer2) {
+        AVFrame *frame = p->allocator_data;
+
+        av_frame_free(&frame);
+    } else {
+        AVBufferRef *buf = p->allocator_data;
+
+        av_buffer_unref(&buf);
+    }
 }
 
 static void libdav1d_init_params(AVCodecContext *c, const Dav1dSequenceHeader *seq)
@@ -136,6 +274,8 @@ static void libdav1d_init_params(AVCodecContext *c, const Dav1dSequenceHeader *s
                | seq->operating_points[0].minor_level;
 
     switch (seq->chr) {
+    case DAV1D_CHR_UNKNOWN:
+        break;
     case DAV1D_CHR_VERTICAL:
         c->chroma_sample_location = AVCHROMA_LOC_LEFT;
         break;
@@ -150,10 +290,7 @@ static void libdav1d_init_params(AVCodecContext *c, const Dav1dSequenceHeader *s
     }
     c->color_range = seq->color_range ? AVCOL_RANGE_JPEG : AVCOL_RANGE_MPEG;
 
-    if (seq->layout == DAV1D_PIXEL_LAYOUT_I444 && c->colorspace == AVCOL_SPC_RGB)
-        c->pix_fmt = pix_fmt_rgb[seq->hbd];
-    else
-        c->pix_fmt = pix_fmt[seq->layout][seq->hbd];
+    c->pix_fmt = libdav1d_get_pixel_format(c, seq);
 
     c->framerate = ff_av1_framerate(seq->num_ticks_per_picture,
                                     (unsigned)seq->num_units_in_tick,
@@ -209,10 +346,22 @@ static av_cold int libdav1d_init(AVCodecContext *c)
 
     av_log(c, AV_LOG_VERBOSE, "libdav1d %s\n", dav1d_version());
 
+    /*
+     * Freeze the allocation mode because it also determines the concrete type
+     * stored in Dav1dPicture.allocator_data.
+     */
+    dav1d->use_get_buffer2 = dav1d->direct_rendering;
+    if (dav1d->use_get_buffer2 &&
+        (!c->get_buffer2 ||
+         c->get_buffer2 == avcodec_default_get_buffer2)) {
+        av_log(c, AV_LOG_ERROR,
+               "Direct rendering requires a custom get_buffer2 callback\n");
+        return AVERROR(EINVAL);
+    }
     dav1d_default_settings(&s);
     s.logger.cookie = c;
     s.logger.callback = libdav1d_log_callback;
-    s.allocator.cookie = dav1d;
+    s.allocator.cookie = c;
     s.allocator.alloc_picture_callback = libdav1d_picture_allocator;
     s.allocator.release_picture_callback = libdav1d_picture_release;
     s.frame_size_limit = c->max_pixels;
@@ -388,11 +537,20 @@ static int libdav1d_receive_frame(AVCodecContext *c, AVFrame *frame)
 
     av_assert0(p->data[0] && p->allocator_data);
 
-    // This requires the custom allocator above
-    frame->buf[0] = av_buffer_ref(p->allocator_data);
-    if (!frame->buf[0]) {
-        dav1d_picture_unref(p);
-        return AVERROR(ENOMEM);
+    if (dav1d->use_get_buffer2) {
+        AVFrame *picture_frame = p->allocator_data;
+
+        res = av_frame_ref(frame, picture_frame);
+        if (res < 0)
+            goto fail;
+    } else {
+        AVBufferRef *buffer = p->allocator_data;
+
+        frame->buf[0] = av_buffer_ref(buffer);
+        if (!frame->buf[0]) {
+            res = AVERROR(ENOMEM);
+            goto fail;
+        }
     }
 
     frame->data[0] = p->data[0];
@@ -588,6 +746,8 @@ static av_cold int libdav1d_close(AVCodecContext *c)
 #define OFFSET(x) offsetof(Libdav1dContext, x)
 #define VD AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_DECODING_PARAM
 static const AVOption libdav1d_options[] = {
+    { "direct_rendering", "Use AVCodecContext.get_buffer2 for picture allocation",
+      OFFSET(direct_rendering), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, VD },
     { "max_frame_delay", "Max frame delay", OFFSET(max_frame_delay), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, DAV1D_MAX_FRAME_DELAY, VD },
     { "filmgrain", "Apply Film Grain", OFFSET(apply_grain), AV_OPT_TYPE_BOOL, { .i64 = -1 }, -1, 1, VD | AV_OPT_FLAG_DEPRECATED },
     { "oppoint",  "Select an operating point of the scalable bitstream", OFFSET(operating_point), AV_OPT_TYPE_INT, { .i64 = -1 }, -1, 31, VD },
@@ -612,7 +772,8 @@ const FFCodec ff_libdav1d_decoder = {
     .close          = libdav1d_close,
     .flush          = libdav1d_flush,
     FF_CODEC_RECEIVE_FRAME_CB(libdav1d_receive_frame),
-    .p.capabilities = AV_CODEC_CAP_DELAY | AV_CODEC_CAP_OTHER_THREADS,
+    .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_DELAY |
+                      AV_CODEC_CAP_OTHER_THREADS,
     .caps_internal  = FF_CODEC_CAP_SETS_FRAME_PROPS |
                       FF_CODEC_CAP_AUTO_THREADS,
     .p.priv_class   = &libdav1d_class,
