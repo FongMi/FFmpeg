@@ -359,19 +359,21 @@ static void free_timelines_list(struct representation *pls)
     pls->n_timelines = 0;
 }
 
+static void close_component(struct representation *pls)
+{
+    avformat_close_input(&pls->ctx);
+    av_freep(&pls->pb.pub.buffer);
+    ff_format_io_close(pls->parent, &pls->input);
+}
+
 static void free_representation(struct representation *pls)
 {
+    close_component(pls);
     free_fragment_list(pls);
     free_timelines_list(pls);
     free_fragment(&pls->cur_seg);
     free_fragment(&pls->init_section);
     av_freep(&pls->init_sec_buf);
-    av_freep(&pls->pb.pub.buffer);
-    ff_format_io_close(pls->parent, &pls->input);
-    if (pls->ctx) {
-        pls->ctx->pb = NULL;
-        avformat_close_input(&pls->ctx);
-    }
 
     av_freep(&pls->assoc_stream);
     av_freep(&pls->url_template);
@@ -457,9 +459,11 @@ static int open_url(AVFormatContext *s, AVIOContext **pb, const char *url,
     else if (strcmp(proto_name, "file") || !strncmp(url, "file,", 5))
         return AVERROR_INVALIDDATA;
 
-    av_freep(pb);
-    av_dict_copy(&tmp, *opts, 0);
-    av_dict_copy(&tmp, opts2, 0);
+    ret = av_dict_copy(&tmp, *opts, 0);
+    if (ret >= 0)
+        ret = av_dict_copy(&tmp, opts2, 0);
+    if (ret < 0)
+        goto end;
     ret = s->io_open(s, pb, url, AVIO_FLAG_READ, &tmp);
     if (ret >= 0) {
         // update cookies on http response with setcookies.
@@ -474,11 +478,11 @@ static int open_url(AVFormatContext *s, AVIOContext **pb, const char *url,
 
     }
 
-    av_dict_free(&tmp);
-
     if (is_http)
         *is_http = av_strstart(proto_name, "http", NULL);
 
+end:
+    av_dict_free(&tmp);
     return ret;
 }
 
@@ -1814,6 +1818,12 @@ static int read_from_url(struct representation *pls, struct fragment *seg,
     return ret;
 }
 
+static int is_single_file(const struct representation *pls)
+{
+    return pls->n_fragments == 1 && !pls->init_section &&
+           pls->fragments[0]->size < 0;
+}
+
 static int open_input(DASHContext *c, struct representation *pls, struct fragment *seg)
 {
     AVDictionary *opts = NULL;
@@ -1831,6 +1841,12 @@ static int open_input(DASHContext *c, struct representation *pls, struct fragmen
          * (if this is in fact a HTTP request) */
         av_dict_set_int(&opts, "offset", seg->url_offset, 0);
         av_dict_set_int(&opts, "end_offset", seg->url_offset + seg->size, 0);
+    } else if (!c->is_live && is_single_file(pls)) {
+        /* Read headers from each representation without starting an
+         * unbounded transfer for every track in the manifest. */
+        ret = av_dict_set_int(&opts, "initial_request_size", 128 * 1024, 0);
+        if (ret < 0)
+            goto cleanup;
     }
     /* Do not make the persistent options non-seekable: a dynamic manifest
      * may become static while it is open. */
@@ -1987,93 +2003,103 @@ static int nested_io_open(AVFormatContext *s, AVIOContext **pb, const char *url,
     return AVERROR(EPERM);
 }
 
-static void close_demux_for_component(struct representation *pls)
+static int component_has_stream_headers(const AVFormatContext *ctx)
 {
-    /* note: the internal buffer could have changed */
-    av_freep(&pls->pb.pub.buffer);
-    memset(&pls->pb, 0x00, sizeof(pls->pb));
-    pls->ctx->pb = NULL;
-    avformat_close_input(&pls->ctx);
+    if (ctx->ctx_flags & AVFMTCTX_NOHEADER || !ctx->nb_streams)
+        return 0;
+
+    for (unsigned i = 0; i < ctx->nb_streams; i++) {
+        const AVCodecParameters *par = ctx->streams[i]->codecpar;
+
+        if (par->codec_id == AV_CODEC_ID_NONE)
+            return 0;
+        if (par->codec_type == AVMEDIA_TYPE_VIDEO &&
+            (!par->width || !par->height))
+            return 0;
+        if (par->codec_type == AVMEDIA_TYPE_AUDIO &&
+            (!par->sample_rate || !par->ch_layout.nb_channels))
+            return 0;
+    }
+
+    return 1;
 }
 
 static int reopen_demux_for_component(AVFormatContext *s, struct representation *pls)
 {
     DASHContext *c = s->priv_data;
-    const AVInputFormat *in_fmt = NULL;
-    AVDictionary  *in_fmt_opts = NULL;
-    uint8_t *avio_ctx_buffer  = NULL;
-    int ret = 0, i;
+    int single_file = !c->is_live && is_single_file(pls);
+    AVDictionary *opts = NULL;
+    AVFormatContext *ctx;
+    int ret;
 
-    if (pls->ctx) {
-        close_demux_for_component(pls);
-    }
+    close_component(pls);
+    if (ff_check_interrupt(&s->interrupt_callback))
+        return AVERROR_EXIT;
 
-    if (ff_check_interrupt(&s->interrupt_callback)) {
-        ret = AVERROR_EXIT;
+    ctx = avformat_alloc_context();
+    if (!ctx)
+        return AVERROR(ENOMEM);
+
+    ret = ff_copy_whiteblacklists(ctx, s);
+    if (ret < 0)
         goto fail;
+
+    if (single_file) {
+        ret = open_input(c, pls, pls->fragments[0]);
+        if (ret < 0)
+            goto fail;
+        ctx->pb = pls->input;
+    } else {
+        uint8_t *avio_ctx_buffer = av_malloc(INITIAL_BUFFER_SIZE);
+        if (!avio_ctx_buffer) {
+            ret = AVERROR(ENOMEM);
+            goto fail;
+        }
+        ffio_init_context(&pls->pb, avio_ctx_buffer, INITIAL_BUFFER_SIZE, 0,
+                          pls, read_data, NULL, c->is_live ? NULL : seek_data);
+        ctx->pb = &pls->pb.pub;
+        ctx->pb->seekable = 0;
     }
 
-    if (!(pls->ctx = avformat_alloc_context())) {
-        ret = AVERROR(ENOMEM);
+    ctx->flags = AVFMT_FLAG_CUSTOM_IO;
+    ctx->probesize = s->probesize > 0 ? s->probesize : 4096;
+    ctx->max_analyze_duration = s->max_analyze_duration > 0 ?
+                                s->max_analyze_duration : 4 * AV_TIME_BASE;
+    ctx->interrupt_callback = s->interrupt_callback;
+    ctx->io_open = nested_io_open;
+
+    ret = av_dict_set(&opts, "decryption_key", c->cenc_decryption_key, 0);
+    if (ret < 0)
         goto fail;
-    }
-
-    avio_ctx_buffer  = av_malloc(INITIAL_BUFFER_SIZE);
-    if (!avio_ctx_buffer ) {
-        ret = AVERROR(ENOMEM);
-        avformat_free_context(pls->ctx);
-        pls->ctx = NULL;
+    ret = av_dict_set(&opts, "decryption_keys", c->cenc_decryption_keys, 0);
+    if (ret < 0)
         goto fail;
-    }
-    av_freep(&pls->pb.pub.buffer);
-    ffio_init_context(&pls->pb, avio_ctx_buffer, INITIAL_BUFFER_SIZE, 0,
-                      pls, read_data, NULL, c->is_live ? NULL : seek_data);
-    pls->pb.pub.seekable = 0;
 
-    if ((ret = ff_copy_whiteblacklists(pls->ctx, s)) < 0) {
-        avformat_free_context(pls->ctx);
-        pls->ctx = NULL;
-        goto fail;
-    }
-
-    pls->ctx->flags = AVFMT_FLAG_CUSTOM_IO;
-    pls->ctx->probesize = s->probesize > 0 ? s->probesize : 1024 * 4;
-    pls->ctx->max_analyze_duration = s->max_analyze_duration > 0 ? s->max_analyze_duration : 4 * AV_TIME_BASE;
-    pls->ctx->interrupt_callback = s->interrupt_callback;
-    ret = av_probe_input_buffer(&pls->pb.pub, &in_fmt, "", NULL, 0, 0);
-    if (ret < 0) {
-        av_log(s, AV_LOG_ERROR, "Error when loading first fragment of playlist\n");
-        avformat_free_context(pls->ctx);
-        pls->ctx = NULL;
-        goto fail;
-    }
-
-    pls->ctx->pb = &pls->pb.pub;
-    pls->ctx->io_open  = nested_io_open;
-
-    if (c->cenc_decryption_key)
-        av_dict_set(&in_fmt_opts, "decryption_key", c->cenc_decryption_key, 0);
-    if (c->cenc_decryption_keys)
-        av_dict_set(&in_fmt_opts, "decryption_keys", c->cenc_decryption_keys, 0);
-
-    // provide additional information from mpd if available
-    ret = avformat_open_input(&pls->ctx, "", in_fmt, &in_fmt_opts); //pls->init_section->url
-    av_dict_free(&in_fmt_opts);
+    ret = avformat_open_input(&ctx, "", NULL, &opts);
     if (ret < 0)
         goto fail;
     if (pls->n_fragments) {
 #if FF_API_R_FRAME_RATE
         if (pls->framerate.den) {
-            for (i = 0; i < pls->ctx->nb_streams; i++)
-                pls->ctx->streams[i]->r_frame_rate = pls->framerate;
+            for (unsigned i = 0; i < ctx->nb_streams; i++)
+                ctx->streams[i]->r_frame_rate = pls->framerate;
         }
 #endif
-        ret = avformat_find_stream_info(pls->ctx, NULL);
-        if (ret < 0)
-            goto fail;
+        if (!single_file || !component_has_stream_headers(ctx)) {
+            ret = avformat_find_stream_info(ctx, NULL);
+            if (ret < 0)
+                goto fail;
+        }
     }
 
+    av_dict_free(&opts);
+    pls->ctx = ctx;
+    return 0;
+
 fail:
+    av_dict_free(&opts);
+    avformat_close_input(&ctx);
+    close_component(pls);
     return ret;
 }
 
@@ -2372,16 +2398,23 @@ static int dash_read_header(AVFormatContext *s)
     return 0;
 }
 
+static int component_needed(const struct representation *pls)
+{
+    if (!pls->nb_assoc_stream)
+        return 1;
+    for (int i = 0; i < pls->nb_assoc_stream; i++)
+        if (pls->assoc_stream[i]->discard < AVDISCARD_ALL)
+            return 1;
+    return 0;
+}
+
 static void recheck_discard_flags(AVFormatContext *s, struct representation **p, int n)
 {
     int i, j;
 
     for (i = 0; i < n; i++) {
         struct representation *pls = p[i];
-        int needed = !pls->nb_assoc_stream;
-
-        for (int j = 0; j < pls->nb_assoc_stream; j++)
-            needed |= pls->assoc_stream[j]->discard < AVDISCARD_ALL;
+        int needed = component_needed(pls);
 
         if (needed && !pls->ctx) {
             pls->cur_seg_offset = 0;
@@ -2393,8 +2426,7 @@ static void recheck_discard_flags(AVFormatContext *s, struct representation **p,
             reopen_demux_for_component(s, pls);
             av_log(s, AV_LOG_INFO, "Now receiving stream_index %d\n", pls->stream_index);
         } else if (!needed && pls->ctx) {
-            close_demux_for_component(pls);
-            ff_format_io_close(pls->parent, &pls->input);
+            close_component(pls);
             av_log(s, AV_LOG_INFO, "No longer receiving stream_index %d\n", pls->stream_index);
         }
     }
@@ -2458,11 +2490,9 @@ static int dash_read_packet(AVFormatContext *s, AVPacket *pkt)
             cur->cur_seg_offset = 0;
             cur->init_sec_buf_read_offset = 0;
             cur->is_restart_needed = 0;
-            ff_format_io_close(cur->parent, &cur->input);
             ret = reopen_demux_for_component(s, cur);
         } else if (ret == AVERROR_EOF) {
-            close_demux_for_component(cur);
-            ff_format_io_close(cur->parent, &cur->input);
+            close_component(cur);
             av_log(s, AV_LOG_DEBUG, "EOF on stream_index %d\n", cur->stream_index);
             // prevent recheck_discard_flags() from re-enabling the component
             for (int i = 0; i < cur->nb_assoc_stream; i++)
@@ -2498,22 +2528,27 @@ static int dash_seek(AVFormatContext *s, struct representation *pls, int64_t see
     if (pls->n_fragments == 1) {
         pls->cur_timestamp = 0;
         pls->cur_seg_offset = 0;
-        if (dry_run)
+        /* Seek only selected single files. They have no segment number to
+         * save for later, so newly selected files need an open here. */
+        if (is_single_file(pls)) {
+            if (!component_needed(pls)) {
+                close_component(pls);
+                return 0;
+            }
+        } else if (dry_run) {
             return 0;
+        }
         /* Components opened while the manifest was dynamic have no seek
          * callback. Reopen them once the manifest becomes static. */
-        if (!pls->pb.pub.seek) {
+        if (!pls->ctx || !pls->ctx->pb->seek) {
             pls->init_sec_buf_read_offset = 0;
-            ff_format_io_close(pls->parent, &pls->input);
             ret = reopen_demux_for_component(s, pls);
             if (ret < 0)
                 return ret;
         }
-        ff_read_frame_flush(pls->ctx);
-        return av_seek_frame(pls->ctx, -1, seek_pos_msec * 1000, flags);
+        return av_seek_frame(pls->ctx, -1,
+                             av_rescale(seek_pos_msec, AV_TIME_BASE, 1000), flags);
     }
-
-    ff_format_io_close(pls->parent, &pls->input);
 
     // find the nearest fragment
     if (pls->n_timelines > 0 && pls->fragment_timescale > 0) {
@@ -2561,14 +2596,17 @@ static int dash_read_seek(AVFormatContext *s, int stream_index, int64_t timestam
 {
     int ret = 0, i;
     DASHContext *c = s->priv_data;
-    int64_t seek_pos_msec = av_rescale_rnd(timestamp, 1000,
-                                           s->streams[stream_index]->time_base.den,
-                                           flags & AVSEEK_FLAG_BACKWARD ?
-                                           AV_ROUND_DOWN : AV_ROUND_UP);
+    int64_t seek_pos_msec;
+
     if ((flags & AVSEEK_FLAG_BYTE) || c->is_live)
         return AVERROR(ENOSYS);
 
-    /* Seek in discarded streams with dry_run=1 to avoid reopening them */
+    seek_pos_msec = av_rescale_q_rnd(timestamp, s->streams[stream_index]->time_base,
+                                   (AVRational) { 1, 1000 },
+                                   flags & AVSEEK_FLAG_BACKWARD ?
+                                   AV_ROUND_DOWN : AV_ROUND_UP);
+
+    /* Update the seek position of closed representations as well. */
     for (i = 0; i < c->n_videos; i++) {
         if (!ret)
             ret = dash_seek(s, c->videos[i], seek_pos_msec, flags, !c->videos[i]->ctx);
