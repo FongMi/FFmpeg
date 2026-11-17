@@ -83,6 +83,11 @@ int ff_hevc_decode_extradata(const uint8_t *data, int size, HEVCParamSets *ps,
     int ret = 0;
     GetByteContext gb;
 
+    if (!size) {
+        *is_nalff = 0;
+        return 0;
+    }
+
     bytestream2_init(&gb, data, size);
 
     /* data[0] == 1 is configurationVersion from 14496-15.
