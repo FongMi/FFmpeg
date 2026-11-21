@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<tt:tt xmlns:tt="http://www.w3.org/ns/ttml" xmlns:tts="http://www.w3.org/ns/ttml#styling" tts:extent="1280px 576px">
+  <tt:head>
+    <tt:styling>
+      <tt:style xml:id="emphasis" tts:color="#112233" />
+    </tt:styling>
+    <tt:layout>
+      <tt:region xml:id="bottom" tts:origin="10% 70%" tts:extent="80% 20%" tts:displayAlign="after" />
+    </tt:layout>
+  </tt:head>
+  <tt:body>
+    <tt:div begin="1s" timeContainer="seq" region="bottom" xml:space="preserve">
+      <tt:p dur="2s" style="emphasis">First  cue<br xmlns="http://www.w3.org/ns/ttml" />second line</tt:p>
+      <tt:p begin="0.5s" dur="1s" tts:fontSize="26.5px">Next cue</tt:p>
+    </tt:div>
+    <tt:div>
+      <tt:p begin="2s" end="2.5s">Overlapping cue</tt:p>
+    </tt:div>
+  </tt:body>
+</tt:tt>

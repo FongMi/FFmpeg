@@ -163,6 +163,13 @@ fate-sub-dvb: CMD = framecrc -i $(TARGET_SAMPLES)/sub/dvbsubtest_filter.ts -map 
 FATE_SUBTITLES-$(call ALLYES, PIPE_PROTOCOL SRT_DEMUXER SUBRIP_DECODER TTML_ENCODER TTML_MUXER) += fate-sub-ttmlenc
 fate-sub-ttmlenc: CMD = fmtstdout ttml -i $(TARGET_SAMPLES)/sub/SubRip_capability_tester.srt
 
+FATE_FFMPEG-$(call ALLYES, FILE_PROTOCOL PIPE_PROTOCOL TTML_DEMUXER TTML_DECODER ASS_ENCODER ASS_MUXER) += fate-sub-ttml-standalone
+fate-sub-ttml-standalone: CMD = fmtstdout ass -i $(SRC_PATH)/tests/sub-standalone.ttml
+
+FATE_FFPROBE-$(call ALLYES, FILE_PROTOCOL TTML_DEMUXER) += fate-sub-ttml-seek
+fate-sub-ttml-seek: CMD = run ffprobe$(PROGSUF)$(EXECSUF) -v error -read_intervals 2.2%+\#2 -show_entries packet=pts,duration -of compact $(SRC_PATH)/tests/sub-standalone.ttml
+fate-sub-ttml-seek: CMP = diff
+
 # visible caption -> TIME-only statement -> CS-only statement; in bitmap mode
 # only the explicit clear screen (CS) must emit an empty (num_rects=0) event.
 FATE_SUBTITLES_PROBE-$(call DEMDEC, MPEGTS, LIBARIBCAPTION) += fate-sub-aribcaption-clear

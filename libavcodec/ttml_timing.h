@@ -51,5 +51,9 @@ int64_t avpriv_ttml_parse_time_expression(const xmlChar *value,
 int avpriv_ttml_resolve_interval(xmlNode *node, const TTMLTiming *timing,
                                  int64_t root_end, TTMLInterval *interval,
                                  int depth);
+int avpriv_ttml_walk_paragraphs(xmlNode *root, const TTMLTiming *timing,
+                                int (*visit)(void *, xmlNode *,
+                                             const TTMLInterval *),
+                                void *opaque);
 
 #endif /* AVCODEC_TTML_TIMING_H */
