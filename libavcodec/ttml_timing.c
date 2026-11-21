@@ -379,3 +379,51 @@ int avpriv_ttml_resolve_interval(xmlNode *node, const TTMLTiming *timing,
 
     return resolve_at_reference(node, timing, &parent, reference, interval);
 }
+
+static int walk_paragraphs(xmlNode *parent, const TTMLTiming *timing,
+                           const TTMLInterval *parent_interval, int depth,
+                           int (*visit)(void *, xmlNode *, const TTMLInterval *),
+                           void *opaque)
+{
+    int64_t reference = parent_interval->begin;
+    int sequential, ret;
+
+    if (depth >= TTML_MAX_TREE_DEPTH)
+        return AVERROR_INVALIDDATA;
+    if ((ret = get_time_container(parent, &sequential)) < 0)
+        return ret;
+
+    for (xmlNode *node = parent->children; node; node = node->next) {
+        TTMLInterval interval;
+
+        if (!is_timed_text_node(node) || !node->ns ||
+            xmlStrcmp(node->ns->href, BAD_CAST TTML_NS))
+            continue;
+        if (reference == AV_NOPTS_VALUE)
+            return AVERROR_INVALIDDATA;
+        ret = resolve_at_reference(node, timing, parent_interval,
+                                   reference, &interval);
+        if (ret < 0)
+            return ret;
+        if (node_is(node, "p"))
+            ret = visit(opaque, node, &interval);
+        else if (node_is(node, "body") || node_is(node, "div"))
+            ret = walk_paragraphs(node, timing, &interval, depth + 1,
+                                  visit, opaque);
+        if (ret < 0)
+            return ret;
+        if (sequential)
+            reference = interval.end;
+    }
+    return 0;
+}
+
+int avpriv_ttml_walk_paragraphs(xmlNode *root, const TTMLTiming *timing,
+                                int (*visit)(void *, xmlNode *,
+                                             const TTMLInterval *),
+                                void *opaque)
+{
+    static const TTMLInterval document = { 0, AV_NOPTS_VALUE };
+
+    return walk_paragraphs(root, timing, &document, 0, visit, opaque);
+}

@@ -772,6 +772,7 @@ OBJS-$(CONFIG_TSCC2_DECODER)           += tscc2.o
 OBJS-$(CONFIG_TTA_DECODER)             += tta.o ttadata.o ttadsp.o
 OBJS-$(CONFIG_TTA_ENCODER)             += ttaenc.o ttaencdsp.o ttadata.o
 OBJS-$(CONFIG_TTML_DECODER)            += ttmldec.o ttml_timing.o ass.o
+OBJS-$(CONFIG_TTML_DEMUXER)            += ttml_timing.o
 OBJS-$(CONFIG_TTML_ENCODER)            += ttmlenc.o ass_split.o
 OBJS-$(CONFIG_TWINVQ_DECODER)          += twinvqdec.o twinvq.o
 OBJS-$(CONFIG_TXD_DECODER)             += txd.o
